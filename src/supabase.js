@@ -4,6 +4,7 @@ const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL;
 const SUPABASE_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const CURRENT_TABLE = import.meta.env.VITE_SUPABASE_CURRENT_TABLE ?? "diario_current";
 const SNAPSHOT_TABLE = import.meta.env.VITE_SUPABASE_SNAPSHOT_TABLE ?? "diario_snapshots";
+const ACTIONS_TABLE = import.meta.env.VITE_SUPABASE_ACTIONS_TABLE ?? "diario_actions";
 
 function isSupabaseConfigured() {
   return Boolean(SUPABASE_URL && SUPABASE_KEY);
@@ -142,4 +143,55 @@ export async function pruneOldSnapshots(userId, keep = 30) {
     .delete()
     .in("id", rows.map((row) => row.id));
   if (deleteError) throw deleteError;
+}
+
+// --- Ações (patches pequenos, um por edição) -------------------------------
+
+// Usa fetch cru (não o cliente do SDK) para poder marcar keepalive:true —
+// isso pede ao navegador pra tentar completar o envio mesmo se a aba fechar
+// logo em seguida. Só funciona bem porque o patch é pequeno (poucos KB), bem
+// dentro do limite que os navegadores garantem pra esse tipo de requisição.
+export async function appendAction(userId, patch) {
+  if (!isSupabaseConfigured()) throw new Error("Supabase não está configurado.");
+  const {
+    data: { session }
+  } = await requireClient().auth.getSession();
+  if (!session?.access_token) throw new Error("Sessão não encontrada.");
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${ACTIONS_TABLE}`, {
+    method: "POST",
+    keepalive: true,
+    headers: {
+      apikey: SUPABASE_KEY,
+      Authorization: `Bearer ${session.access_token}`,
+      "Content-Type": "application/json",
+      Prefer: "return=minimal"
+    },
+    body: JSON.stringify({ user_id: userId, patch })
+  });
+  if (!response.ok) {
+    const text = await response.text().catch(() => "");
+    throw new Error(`Falha ao salvar ação (${response.status}): ${text}`);
+  }
+}
+
+export async function fetchPendingActions(userId, sinceIso) {
+  let query = requireClient()
+    .from(ACTIONS_TABLE)
+    .select("id,created_at,patch")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: true });
+  if (sinceIso) query = query.gt("created_at", sinceIso);
+  const { data, error } = await query;
+  if (error) throw error;
+  return data ?? [];
+}
+
+export async function deleteActions(userId, ids) {
+  if (!ids?.length) return;
+  const { error } = await requireClient()
+    .from(ACTIONS_TABLE)
+    .delete()
+    .eq("user_id", userId)
+    .in("id", ids);
+  if (error) throw error;
 }

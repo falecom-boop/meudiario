@@ -31,7 +31,10 @@ import {
   getSession,
   onAuthStateChange,
   sendPasswordResetEmail,
-  updatePassword
+  updatePassword,
+  appendAction,
+  fetchPendingActions,
+  deleteActions
 } from "./supabase";
 import "./styles.css";
 
@@ -50,6 +53,8 @@ const APP_LOCK_PIN_HASH_KEY = "checkout-turmas:app-lock-pin-hash";
 const SYNC_SCHEMA_VERSION = 2;
 const SYNC_HISTORY_LIMIT = 4;
 const AUTO_SYNC_DELAY_MS = 2000;
+const ACTION_COMPACTION_THRESHOLD = 20;
+const COMPACTION_INTERVAL_MS = 5 * 60 * 1000;
 const APP_TITLE = "Meu Diário";
 const APP_VERSION = "2";
 const APP_LOGO_SRC = "icon.png";
@@ -566,7 +571,17 @@ async function loadRemoteState(userId) {
   if (!supabaseStatus().configured || !userId) return null;
   try {
     const current = await fetchCurrentState(userId);
-    return current?.payload ?? null;
+    if (!current?.payload) return null;
+    try {
+      const pending = await fetchPendingActions(userId, current.updated_at);
+      if (pending.length) {
+        const reconstructedData = applyPatches(migrateData(current.payload.data), pending);
+        return { ...current.payload, data: reconstructedData };
+      }
+    } catch (error) {
+      console.warn("Não foi possível aplicar ações pendentes, usando o último snapshot:", error);
+    }
+    return current.payload;
   } catch (error) {
     console.warn("Supabase load failed:", error);
     return null;
@@ -1149,6 +1164,77 @@ function mergeBackupData(currentData, importedData) {
     }),
     summary: { classesAdded, studentsAdded, lessonsAdded, assessmentsAdded, recoveriesAdded, attendanceRecordsMerged, gradeValuesMerged, gradeConflicts }
   };
+}
+
+// --- Diff/patch por ação ----------------------------------------------------
+// Em vez de reenviar o diário inteiro a cada edição, cada campo-lista é
+// comparado por uma chave de identidade e só o que mudou (added/updated/removed)
+// vira o "patch" daquela ação — pequeno o bastante pra caber com folga na
+// garantia do navegador de completar o envio mesmo se a aba fechar na hora.
+const DIFF_FIELD_KEYS = {
+  classes: (item) => item.id,
+  events: (item) => item.id ?? stableStringify(item),
+  lessons: (item) => item.id,
+  assessments: (item) => item.id,
+  recoveries: (item) => item.id,
+  attendanceSummaries: (item) =>
+    `${item.classId}|${item.studentId}|${item.periodId}|${normalizeKey(item.source ?? "")}`
+};
+
+function diffData(previous, next) {
+  const patch = {};
+  if (stableStringify(previous?.schoolYear) !== stableStringify(next?.schoolYear)) {
+    patch.schoolYear = next.schoolYear;
+  }
+  for (const [field, keyOf] of Object.entries(DIFF_FIELD_KEYS)) {
+    const prevItems = Array.isArray(previous?.[field]) ? previous[field] : [];
+    const nextItems = Array.isArray(next?.[field]) ? next[field] : [];
+    const prevMap = new Map(prevItems.map((item) => [keyOf(item), item]));
+    const nextMap = new Map(nextItems.map((item) => [keyOf(item), item]));
+    const added = [];
+    const updated = [];
+    const removed = [];
+    for (const [key, item] of nextMap) {
+      const prevItem = prevMap.get(key);
+      if (!prevItem) added.push(item);
+      else if (stableStringify(prevItem) !== stableStringify(item)) updated.push(item);
+    }
+    for (const key of prevMap.keys()) {
+      if (!nextMap.has(key)) removed.push(key);
+    }
+    if (added.length || updated.length || removed.length) {
+      patch[field] = { added, updated, removed };
+    }
+  }
+  return patch;
+}
+
+function isPatchEmpty(patch) {
+  return !patch || Object.keys(patch).length === 0;
+}
+
+function applyFieldPatch(items, keyOf, fieldPatch) {
+  if (!fieldPatch) return items;
+  const map = new Map(items.map((item) => [keyOf(item), item]));
+  for (const key of fieldPatch.removed ?? []) map.delete(key);
+  for (const item of [...(fieldPatch.added ?? []), ...(fieldPatch.updated ?? [])]) map.set(keyOf(item), item);
+  return [...map.values()];
+}
+
+function applyPatch(base, patch) {
+  if (isPatchEmpty(patch)) return base;
+  const result = { ...base };
+  if (patch.schoolYear !== undefined) result.schoolYear = patch.schoolYear;
+  for (const [field, keyOf] of Object.entries(DIFF_FIELD_KEYS)) {
+    if (patch[field]) {
+      result[field] = applyFieldPatch(Array.isArray(base[field]) ? base[field] : [], keyOf, patch[field]);
+    }
+  }
+  return migrateData(result);
+}
+
+function applyPatches(base, patches) {
+  return patches.reduce((acc, { patch }) => applyPatch(acc, patch), base);
 }
 
 function formatDate(value) {
@@ -2350,6 +2436,7 @@ function App() {
 
       if (remoteHash === localHash) {
         saveLastSyncedHash(remoteHash);
+        lastSavedDataRef.current = migrateData(data);
         setAutoSaveMessage("Dados já sincronizados.");
         await refreshRemoteSnapshots();
         return true;
@@ -2372,6 +2459,7 @@ function App() {
           setGradeDecimals(decimals);
         }
         saveLastSyncedHash(remoteHash);
+        lastSavedDataRef.current = loadedData;
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
         } catch {
@@ -2437,6 +2525,7 @@ function App() {
         }
         await saveRemoteState(userId, mergedPayload, { forceSnapshot: true });
         saveLastSyncedHash(mergedPayload.integrity?.hash);
+        lastSavedDataRef.current = result.data;
 
         const addedTotal =
           result.summary.classesAdded +
@@ -2590,31 +2679,35 @@ function App() {
 
     setRemoteSyncLoading(true);
     try {
-      let payload = await buildBackupPayload(true);
-
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
-      } catch (error) {
-        console.warn("Falha ao salvar backup local antes do envio remoto:", error);
-      }
-
       if (directoryHandle) {
+        // Usar um backup de pasta escolhido à mão é uma substituição deliberada
+        // do estado atual — não passa pela mesclagem de ações pendentes, porque
+        // o professor está dizendo explicitamente "use este arquivo como verdade".
         const directoryPayload = await readLatestBackupFileFromDirectoryHandle(directoryHandle);
         if (!directoryPayload) {
           setImportMessage("Envio cancelado. Nenhum backup válido foi encontrado na pasta.");
           return;
         }
-        payload = directoryPayload;
+        const migratedData = migrateData(directoryPayload.data);
+        suppressNextAutoSaveRef.current = true;
+        setData(migratedData);
         try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(directoryPayload));
         } catch {
           // Ignorar falha de backup local
         }
+        await saveRemoteState(userId, directoryPayload, { forceSnapshot: true });
+        saveLastSyncedHash(directoryPayload.integrity?.hash);
+        lastSavedDataRef.current = migratedData;
+        pendingActionCountRef.current = 0;
+        lastCompactionAtRef.current = Date.now();
+        await refreshRemoteSnapshots();
+      } else {
+        // Clique manual em "Salvar" = compactação sob demanda: junta as ações
+        // pendentes (inclusive de outro aparelho) com o estado local e grava
+        // um snapshot completo, sem esperar o limite de ações/tempo.
+        await compactToSnapshot();
       }
-
-      await saveRemoteState(userId, payload, { forceSnapshot: true });
-      saveLastSyncedHash(payload.integrity?.hash);
-      await refreshRemoteSnapshots();
       setAutoSaveMessage("Dados salvos na nuvem com sucesso.");
       setAutoSaveFailed(false);
       setImportMessage("Dados salvos com sucesso na nuvem.");
@@ -2626,23 +2719,70 @@ function App() {
     }
   }
 
-  async function autoSaveToSupabase() {
+  async function compactToSnapshot() {
     if (!supabaseStatus().configured || !userId) return;
-    if (autoSaveInFlightRef.current) return;
-    autoSaveInFlightRef.current = true;
-    window.clearTimeout(autoSaveTimerRef.current);
+    if (compactionInFlightRef.current) return;
+    compactionInFlightRef.current = true;
     try {
-      const payload = await buildBackupPayload(true);
-      await saveRemoteState(userId, payload);
+      const current = await fetchCurrentState(userId);
+      const baseData = migrateData(current?.payload?.data ?? initialData);
+      // Busca TODAS as ações pendentes (sem filtro de data) — assim, mesmo que
+      // alguma tenha ficado "órfã" de uma compactação anterior, ela é varrida
+      // aqui também, em vez de ficar presa pra sempre no banco.
+      const pending = await fetchPendingActions(userId);
+      const reconstructedRemote = applyPatches(baseData, pending);
+      const merged = mergeBackupData(data, reconstructedRemote).data;
+      suppressNextAutoSaveRef.current = true;
+      setData(merged);
+      const payload = await buildBackupPayload(true, { data: merged });
+      await saveRemoteState(userId, payload, { forceSnapshot: true });
+      if (pending.length) await deleteActions(userId, pending.map((row) => row.id));
       saveLastSyncedHash(payload.integrity?.hash);
+      lastSavedDataRef.current = merged;
+      pendingActionCountRef.current = 0;
+      lastCompactionAtRef.current = Date.now();
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       } catch {
         // Ignorar falha de backup local
       }
       await refreshRemoteSnapshots();
+    } finally {
+      compactionInFlightRef.current = false;
+    }
+  }
+
+  async function appendActionToSupabase() {
+    if (!supabaseStatus().configured || !userId) return;
+    if (autoSaveInFlightRef.current) return;
+    autoSaveInFlightRef.current = true;
+    window.clearTimeout(autoSaveTimerRef.current);
+    try {
+      const migratedNext = migrateData(data);
+      const patch = diffData(lastSavedDataRef.current ?? migratedNext, migratedNext);
+      if (isPatchEmpty(patch)) {
+        setAutoSaveFailed(false);
+        return;
+      }
+      await appendAction(userId, patch);
+      lastSavedDataRef.current = migratedNext;
+      pendingActionCountRef.current += 1;
+      let cachePayload = null;
+      try {
+        cachePayload = await buildBackupPayload(false, { data: migratedNext });
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(cachePayload));
+        saveLastSyncedHash(cachePayload.integrity?.hash);
+      } catch {
+        // Ignorar falha de backup local
+      }
       setAutoSaveMessage("Alteração salva na nuvem.");
       setAutoSaveFailed(false);
+      const shouldCompact =
+        pendingActionCountRef.current >= ACTION_COMPACTION_THRESHOLD ||
+        Date.now() - lastCompactionAtRef.current >= COMPACTION_INTERVAL_MS;
+      if (shouldCompact) {
+        compactToSnapshot().catch((error) => console.warn("Falha ao compactar ações:", error));
+      }
     } catch (error) {
       setAutoSaveMessage(`Não foi possível salvar na nuvem (dados mantidos só neste aparelho até a conexão voltar): ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
@@ -2657,7 +2797,13 @@ function App() {
   }
   const autoSaveTimerRef = useRef(0);
   const autoSaveInFlightRef = useRef(false);
+  const compactionInFlightRef = useRef(false);
   const suppressNextAutoSaveRef = useRef(false);
+  const lastSavedDataRef = useRef(migrateData(data));
+  const pendingActionCountRef = useRef(0);
+  const lastCompactionAtRef = useRef(Date.now());
+  const appendActionRef = useRef(appendActionToSupabase);
+  appendActionRef.current = appendActionToSupabase;
   activeGradeDecimals = gradeDecimals;
 
   useEffect(() => {
@@ -2689,7 +2835,7 @@ function App() {
 
     setAutoSaveMessage("Alteração salva neste aparelho. Sincronização remota agendada...");
     autoSaveTimerRef.current = window.setTimeout(() => {
-      autoSaveToSupabase();
+      appendActionToSupabase();
     }, AUTO_SYNC_DELAY_MS);
 
     return () => window.clearTimeout(autoSaveTimerRef.current);
@@ -2701,7 +2847,7 @@ function App() {
       if (autoSaveTimerRef.current) {
         window.clearTimeout(autoSaveTimerRef.current);
         autoSaveTimerRef.current = 0;
-        autoSaveToSupabase();
+        appendActionRef.current();
       }
     }
     function handleVisibilityChange() {
@@ -2723,7 +2869,7 @@ function App() {
     // até 64KB). Por isso, se ainda houver algo pendente de enviar, avisamos
     // antes de fechar em vez de arriscar perder a alteração silenciosamente.
     function handleBeforeUnload(event) {
-      const pending = !!autoSaveTimerRef.current || autoSaveInFlightRef.current || autoSaveFailed;
+      const pending = !!autoSaveTimerRef.current || autoSaveInFlightRef.current || compactionInFlightRef.current || autoSaveFailed;
       if (!pending) return;
       event.preventDefault();
       event.returnValue = "";
@@ -2735,7 +2881,7 @@ function App() {
   useEffect(() => {
     if (!appUnlocked) return undefined;
     function handleOnline() {
-      if (autoSaveFailed) autoSaveToSupabase();
+      if (autoSaveFailed) appendActionRef.current();
     }
     window.addEventListener("online", handleOnline);
     return () => window.removeEventListener("online", handleOnline);
@@ -6368,7 +6514,7 @@ function App() {
           <div className={`notice autosave-notice${autoSaveFailed ? " warning" : ""}`} role="status">
             {autoSaveMessage}
             {autoSaveFailed && (
-              <button className="secondary" type="button" onClick={() => autoSaveToSupabase()}>
+              <button className="secondary" type="button" onClick={() => appendActionToSupabase()}>
                 Tentar novamente
               </button>
             )}

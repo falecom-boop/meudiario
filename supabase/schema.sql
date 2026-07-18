@@ -1,21 +1,11 @@
--- Diário de Classe · Schema do Supabase (v2 — login real via Supabase Auth)
+-- Diário de Classe · Schema do Supabase (v3 — salvamento por ação)
 -- Como usar: Supabase Dashboard > SQL Editor > New query > cole tudo > Run.
 --
--- ATENÇÃO: este script APAGA as tabelas antigas (diario_current/diario_snapshots)
--- e recria do zero, agora com uma linha por professor autenticado em vez de um
--- registro único compartilhado ("current"). Só rode isso se você já sabe que
--- pode perder o conteúdo de teste que estiver salvo hoje nessas tabelas.
---
--- Depois de rodar este script, vá em:
---   Authentication > Providers > Email > desligue "Confirm email"
---   Authentication > URL Configuration > Redirect URLs > adicione a URL do app
---     (ex.: http://localhost:5173 e a URL da Vercel quando publicar)
-
-drop table if exists public.diario_snapshots;
-drop table if exists public.diario_current;
+-- Este script é seguro pra rodar de novo (usa IF NOT EXISTS / OR REPLACE) —
+-- não apaga as tabelas existentes nem os dados reais já salvos.
 
 -- 1) Estado atual do diário — uma linha por professor, id = id do usuário logado
-create table public.diario_current (
+create table if not exists public.diario_current (
   id uuid primary key references auth.users (id) on delete cascade,
   payload jsonb not null,
   updated_at timestamptz not null default now()
@@ -36,7 +26,7 @@ create trigger trg_diario_current_updated_at
   for each row execute function public.set_updated_at();
 
 -- 2) Histórico de snapshots/backups — várias linhas por professor
-create table public.diario_snapshots (
+create table if not exists public.diario_snapshots (
   id uuid primary key,
   user_id uuid not null references auth.users (id) on delete cascade,
   label text,
@@ -49,16 +39,31 @@ create table public.diario_snapshots (
   payload jsonb not null
 );
 
-create index idx_diario_snapshots_user_created
+create index if not exists idx_diario_snapshots_user_created
   on public.diario_snapshots (user_id, created_at desc);
 
--- 3) RLS
--- Agora o app faz login de verdade com Supabase Auth, então cada professor só
--- pode ler/escrever a própria linha (id/user_id = auth.uid()). O papel "anon"
--- não tem mais acesso nenhum a essas tabelas.
+-- 3) Ações — cada edição (uma nota, uma falta, uma turma) grava só o que
+-- mudou aqui, em vez do diário inteiro. Linhas pequenas de propósito, pra
+-- caber com folga na garantia do navegador de enviar mesmo se a aba fechar
+-- na hora. Periodicamente essas linhas são compactadas dentro de
+-- diario_current e apagadas daqui (ver compactToSnapshot no app).
+create table if not exists public.diario_actions (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users (id) on delete cascade,
+  created_at timestamptz not null default now(),
+  patch jsonb not null
+);
+
+create index if not exists idx_diario_actions_user_created
+  on public.diario_actions (user_id, created_at asc);
+
+-- 4) RLS
+-- Cada professor só pode ler/escrever a própria linha (id/user_id =
+-- auth.uid()). O papel "anon" não tem acesso nenhum a essas tabelas.
 
 alter table public.diario_current enable row level security;
 alter table public.diario_snapshots enable row level security;
+alter table public.diario_actions enable row level security;
 
 drop policy if exists "anon full access" on public.diario_current;
 drop policy if exists "own current" on public.diario_current;
@@ -76,13 +81,22 @@ create policy "own snapshots" on public.diario_snapshots
   using (user_id = auth.uid())
   with check (user_id = auth.uid());
 
--- 4) Privilégios de tabela (RLS restringe linhas, mas o papel também precisa
+drop policy if exists "own actions" on public.diario_actions;
+create policy "own actions" on public.diario_actions
+  for all
+  to authenticated
+  using (user_id = auth.uid())
+  with check (user_id = auth.uid());
+
+-- 5) Privilégios de tabela (RLS restringe linhas, mas o papel também precisa
 -- da permissão básica sobre a tabela). Revoga do "anon" e concede só para
 -- usuários autenticados.
 
 revoke all on public.diario_current from anon;
 revoke all on public.diario_snapshots from anon;
+revoke all on public.diario_actions from anon;
 
 grant usage on schema public to authenticated;
 grant select, insert, update, delete on public.diario_current to authenticated;
 grant select, insert, update, delete on public.diario_snapshots to authenticated;
+grant select, insert, delete on public.diario_actions to authenticated;
