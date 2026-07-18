@@ -452,7 +452,11 @@ function loadData() {
       const stored = localStorage.getItem(key);
       if (!stored) continue;
       try {
-        return migrateData(JSON.parse(stored));
+        const parsed = JSON.parse(stored);
+        // O que fica salvo em STORAGE_KEY normalmente é o payload completo de
+        // sincronização (com .data aninhado), não o objeto de dados puro — precisa
+        // desembrulhar, senão migrateData() não acha "classes" e zera tudo.
+        return migrateData(parsed?.data ?? parsed);
       } catch {
         // Tenta a versao anterior se uma chave local estiver corrompida.
       }
@@ -2368,6 +2372,11 @@ function App() {
           setGradeDecimals(decimals);
         }
         saveLastSyncedHash(remoteHash);
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+        } catch {
+          // Ignorar falha de backup local
+        }
 
         const loadedAt = payload.exportedAt ?? payload.createdAt ?? new Date().toISOString();
         setAutoSaveMessage(`Dados carregados da nuvem. Último backup ${new Intl.DateTimeFormat("pt-BR", {
@@ -2381,10 +2390,72 @@ function App() {
         return true;
       }
 
-      // Há alterações locais ainda não enviadas e o Supabase tem uma versão diferente:
-      // provavelmente uma edição feita em outro aparelho. Pedir revisão antes de aplicar.
+      // Há alterações locais ainda não enviadas e a nuvem tem uma versão diferente:
+      // provavelmente uma edição feita em outro aparelho.
       const remoteSnapshot = await verifySnapshotIntegrity(snapshotFromPayload(payload));
       if (!remoteSnapshot?.data) throw new Error("Não foi possível interpretar os dados recebidos.");
+
+      if (remoteSnapshot.integrityStatus !== "invalid") {
+        // Mesclar é seguro por design (nunca apaga turma/aluno/aula/nota existente), então
+        // resolvemos sozinhos em vez de travar o professor numa tela de decisão manual —
+        // a maioria só fecha a aba sem escolher nada.
+        const incomingSettings = {
+          teacherName: payload.teacherName ?? payload.settings?.teacherName,
+          subjectName: payload.subjectName ?? payload.settings?.subjectName,
+          gradeDecimals: payload.settings?.gradeDecimals
+        };
+        const result = mergeBackupData(data, remoteSnapshot.data);
+        suppressNextAutoSaveRef.current = true;
+        setData(result.data);
+        const mergedTeacherName = teacherName || incomingSettings.teacherName || "";
+        const mergedSubjectName = subjectName || incomingSettings.subjectName || "";
+        const mergedGradeDecimals = [0, 1, 2].includes(Number(incomingSettings.gradeDecimals))
+          ? Number(incomingSettings.gradeDecimals)
+          : gradeDecimals;
+        if (!teacherName && incomingSettings.teacherName) {
+          setTeacherName(incomingSettings.teacherName);
+          setTeacherDraft(incomingSettings.teacherName);
+        }
+        if (!subjectName && incomingSettings.subjectName) {
+          setSubjectName(incomingSettings.subjectName);
+        }
+        if ([0, 1, 2].includes(Number(incomingSettings.gradeDecimals))) {
+          setGradeDecimals(Number(incomingSettings.gradeDecimals));
+        }
+        setSelectedClassId(result.data.classes[0]?.id ?? "");
+
+        const mergedPayload = await buildBackupPayload(true, {
+          data: result.data,
+          teacherName: mergedTeacherName,
+          subjectName: mergedSubjectName,
+          gradeDecimals: mergedGradeDecimals
+        });
+        try {
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(mergedPayload));
+        } catch {
+          // Ignorar falha de backup local
+        }
+        await saveRemoteState(userId, mergedPayload, { forceSnapshot: true });
+        saveLastSyncedHash(mergedPayload.integrity?.hash);
+
+        const addedTotal =
+          result.summary.classesAdded +
+          result.summary.studentsAdded +
+          result.summary.lessonsAdded +
+          result.summary.assessmentsAdded +
+          (result.summary.recoveriesAdded ?? 0) +
+          (result.summary.attendanceRecordsMerged ?? 0) +
+          (result.summary.gradeValuesMerged ?? 0);
+        const mergeMessage = addedTotal
+          ? `Sincronizamos alterações de outro aparelho: ${result.summary.classesAdded} turma(s), ${result.summary.studentsAdded} aluno(s), ${result.summary.lessonsAdded} aula(s), ${result.summary.assessmentsAdded} avaliação(ões) adicionadas automaticamente.${result.summary.gradeConflicts ? ` ${result.summary.gradeConflicts} conflito(s) de nota foram mantidos com o valor deste aparelho.` : ""}`
+          : "Dados já sincronizados.";
+        setAutoSaveMessage(mergeMessage);
+        if (!silent) setImportMessage(mergeMessage);
+        await refreshRemoteSnapshots();
+        return true;
+      }
+
+      // Integridade não verificada: não arriscar mesclar sozinho, pedir revisão.
       setSyncReview({
         mode: "merge",
         fileName: `Nuvem${payload.sourceDevice ? ` (${payload.sourceDevice})` : ""}`,
@@ -2397,7 +2468,7 @@ function App() {
       });
       setSelectedSyncSnapshotId(remoteSnapshot.id);
       if (!silent) {
-        setImportMessage("Encontramos dados diferentes na nuvem (provavelmente editados em outro aparelho). Revise antes de aplicar.");
+        setImportMessage("Encontramos uma versão na nuvem que não passou na verificação de integridade. Revise antes de aplicar.");
       }
       setAutoSaveMessage("Alterações remotas aguardando sua revisão.");
       await refreshRemoteSnapshots();
@@ -2564,6 +2635,11 @@ function App() {
       const payload = await buildBackupPayload(true);
       await saveRemoteState(userId, payload);
       saveLastSyncedHash(payload.integrity?.hash);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+      } catch {
+        // Ignorar falha de backup local
+      }
       await refreshRemoteSnapshots();
       setAutoSaveMessage("Alteração salva na nuvem.");
       setAutoSaveFailed(false);
@@ -3609,12 +3685,16 @@ function App() {
     });
   }
 
-  async function buildBackupPayload(includeHistory = false) {
+  async function buildBackupPayload(includeHistory = false, overrides = {}) {
+    const effectiveData = overrides.data ?? data;
+    const effectiveTeacherName = overrides.teacherName ?? teacherName;
+    const effectiveSubjectName = overrides.subjectName ?? subjectName;
+    const effectiveGradeDecimals = overrides.gradeDecimals ?? gradeDecimals;
     const currentSnapshot = await attachSnapshotIntegrity(createSyncSnapshot({
-      data,
-      teacherName,
-      subjectName,
-      gradeDecimals,
+      data: effectiveData,
+      teacherName: effectiveTeacherName,
+      subjectName: effectiveSubjectName,
+      gradeDecimals: effectiveGradeDecimals,
       deviceId,
       deviceLabel: syncDeviceLabel(),
       reason: "Backup"
@@ -3631,12 +3711,12 @@ function App() {
       exportedAt: currentSnapshot.createdAt,
       sourceDeviceId: deviceId,
       sourceDevice: syncDeviceLabel(),
-      teacherName,
-      subjectName,
+      teacherName: effectiveTeacherName,
+      subjectName: effectiveSubjectName,
       settings: {
-        teacherName,
-        subjectName,
-        gradeDecimals
+        teacherName: effectiveTeacherName,
+        subjectName: effectiveSubjectName,
+        gradeDecimals: effectiveGradeDecimals
       },
       integrity: currentSnapshot.integrity,
       data: currentSnapshot.data,
@@ -3645,7 +3725,7 @@ function App() {
   }
 
 
-  function applySyncReview() {
+  async function applySyncReview() {
     if (!syncReview) return;
     const selectedSnapshot = syncReview.snapshots.find((snapshot) => snapshot.id === selectedSyncSnapshotId) ?? syncReview.snapshots[0];
     if (!selectedSnapshot) {
@@ -3683,10 +3763,16 @@ function App() {
       reason: syncReview.mode === "merge" ? "Antes de atualizar" : "Antes de restaurar"
     });
     saveSyncHistory([localSafetySnapshot, ...syncReview.snapshots, ...loadSyncHistory()]);
+    suppressNextAutoSaveRef.current = true;
 
     if (syncReview.mode === "merge") {
       const result = mergeBackupData(data, selectedSnapshot.data);
       setData(result.data);
+      const mergedTeacherName = teacherName || incomingSettings.teacherName || "";
+      const mergedSubjectName = subjectName || incomingSettings.subjectName || "";
+      const mergedGradeDecimals = [0, 1, 2].includes(Number(incomingSettings.gradeDecimals))
+        ? Number(incomingSettings.gradeDecimals)
+        : gradeDecimals;
       if (!teacherName && incomingSettings.teacherName) {
         setTeacherName(incomingSettings.teacherName);
         setTeacherDraft(incomingSettings.teacherName);
@@ -3712,11 +3798,30 @@ function App() {
           ? `Dados atualizados com "${selectedSnapshot.label}". Novos itens: ${result.summary.classesAdded} turma(s), ${result.summary.studentsAdded} aluno(s), ${result.summary.lessonsAdded} aula(s), ${result.summary.assessmentsAdded} avaliação(ões), ${result.summary.recoveriesAdded ?? 0} recuperação(ões), ${result.summary.attendanceRecordsMerged ?? 0} registro(s) de chamada e ${result.summary.gradeValuesMerged ?? 0} nota(s).${result.summary.gradeConflicts ? ` Atenção: ${result.summary.gradeConflicts} conflito(s) de nota foram mantidos com o valor deste aparelho.` : ""}`
           : `Dados atualizados com "${selectedSnapshot.label}". Nenhum dado novo foi encontrado.${result.summary.gradeConflicts ? ` Atenção: ${result.summary.gradeConflicts} conflito(s) de nota foram mantidos com o valor deste aparelho.` : ""}`
       );
+      if (userId) {
+        const mergedPayload = await buildBackupPayload(true, {
+          data: result.data,
+          teacherName: mergedTeacherName,
+          subjectName: mergedSubjectName,
+          gradeDecimals: mergedGradeDecimals
+        });
+        try {
+          await saveRemoteState(userId, mergedPayload, { forceSnapshot: true });
+          saveLastSyncedHash(mergedPayload.integrity?.hash);
+        } catch (error) {
+          console.warn("Não foi possível salvar a mesclagem na nuvem imediatamente:", error);
+        }
+      }
       return;
     }
 
     const restoreData = migrateData(selectedSnapshot.data);
     setData(restoreData);
+    const restoredTeacherName = incomingSettings.teacherName || teacherName || "";
+    const restoredSubjectName = incomingSettings.subjectName || subjectName || "";
+    const restoredGradeDecimals = [0, 1, 2].includes(Number(incomingSettings.gradeDecimals))
+      ? Number(incomingSettings.gradeDecimals)
+      : gradeDecimals;
     if (incomingSettings.teacherName) {
       setTeacherName(incomingSettings.teacherName);
       setTeacherDraft(incomingSettings.teacherName);
@@ -3730,6 +3835,20 @@ function App() {
     setSelectedClassId(restoreData.classes[0]?.id ?? "");
     setSyncReview(null);
     setImportMessage(`Backup restaurado: ${selectedSnapshot.label}. Uma cópia de segurança anterior foi guardada no histórico local.`);
+    if (userId) {
+      const restoredPayload = await buildBackupPayload(true, {
+        data: restoreData,
+        teacherName: restoredTeacherName,
+        subjectName: restoredSubjectName,
+        gradeDecimals: restoredGradeDecimals
+      });
+      try {
+        await saveRemoteState(userId, restoredPayload, { forceSnapshot: true });
+        saveLastSyncedHash(restoredPayload.integrity?.hash);
+      } catch (error) {
+        console.warn("Não foi possível salvar a restauração na nuvem imediatamente:", error);
+      }
+    }
   }
 
   async function handleJsonFileSelected(event) {
