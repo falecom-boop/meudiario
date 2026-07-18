@@ -50,10 +50,9 @@ const APP_LOCK_PIN_HASH_KEY = "checkout-turmas:app-lock-pin-hash";
 const SYNC_SCHEMA_VERSION = 2;
 const SYNC_HISTORY_LIMIT = 4;
 const AUTO_SYNC_DELAY_MS = 8000;
-const SCHOOL_NAME = "CAp UFRJ";
-const APP_TITLE = "Diário de Classe";
-const APP_VERSION = "1.2";
-const SCHOOL_LOGO_SRC = "cap-ufrj-logo.svg";
+const APP_TITLE = "Meu Diário";
+const APP_VERSION = "2";
+const APP_LOGO_SRC = "icon.png";
 const ATTENDANCE_NOT_TAKEN = "not-taken";
 const DEFAULT_GRADE_DECIMALS = 1;
 let activeGradeDecimals = DEFAULT_GRADE_DECIMALS;
@@ -571,7 +570,7 @@ async function loadRemoteState(userId) {
 }
 
 async function saveRemoteState(userId, payload, { forceSnapshot = false } = {}) {
-  if (!supabaseStatus().configured) throw new Error("Supabase não está configurado.");
+  if (!supabaseStatus().configured) throw new Error("Sincronização remota não está configurada.");
   if (!userId) throw new Error("Nenhum professor autenticado.");
   await saveCurrentState(userId, payload);
   if (!forceSnapshot && !shouldCreateSnapshot()) return;
@@ -2322,18 +2321,18 @@ function App() {
 
   async function loadLatestFromSupabase({ silent = false } = {}) {
     if (!supabaseStatus().configured) {
-      if (!silent) setImportMessage("Supabase não está configurado. Configure as variáveis de ambiente e tente novamente.");
-      setAutoSaveMessage("Supabase não configurado. Os dados são salvos localmente.");
+      if (!silent) setImportMessage("Sincronização remota não está configurada. Tente novamente mais tarde.");
+      setAutoSaveMessage("Sincronização remota não configurada. Os dados são salvos localmente.");
       return false;
     }
     setRemoteSyncLoading(true);
     setSupabaseInfo(supabaseStatus());
     try {
-      setAutoSaveMessage("Carregando dados do Supabase...");
+      setAutoSaveMessage("Carregando dados da nuvem...");
       const payload = await loadRemoteState(userId);
       if (!payload?.data) {
-        if (!silent) setImportMessage("Nenhuma versão remota encontrada no Supabase.");
-        setAutoSaveMessage("Nenhuma versão remota encontrada no Supabase.");
+        if (!silent) setImportMessage("Nenhuma versão remota encontrada.");
+        setAutoSaveMessage("Nenhuma versão remota encontrada.");
         await refreshRemoteSnapshots();
         return false;
       }
@@ -2347,7 +2346,7 @@ function App() {
 
       if (remoteHash === localHash) {
         saveLastSyncedHash(remoteHash);
-        setAutoSaveMessage("Dados já sincronizados com o Supabase.");
+        setAutoSaveMessage("Dados já sincronizados.");
         await refreshRemoteSnapshots();
         return true;
       }
@@ -2371,7 +2370,7 @@ function App() {
         saveLastSyncedHash(remoteHash);
 
         const loadedAt = payload.exportedAt ?? payload.createdAt ?? new Date().toISOString();
-        setAutoSaveMessage(`Dados carregados do Supabase. Último backup ${new Intl.DateTimeFormat("pt-BR", {
+        setAutoSaveMessage(`Dados carregados da nuvem. Último backup ${new Intl.DateTimeFormat("pt-BR", {
           day: "2-digit",
           month: "2-digit",
           year: "numeric",
@@ -2385,10 +2384,10 @@ function App() {
       // Há alterações locais ainda não enviadas e o Supabase tem uma versão diferente:
       // provavelmente uma edição feita em outro aparelho. Pedir revisão antes de aplicar.
       const remoteSnapshot = await verifySnapshotIntegrity(snapshotFromPayload(payload));
-      if (!remoteSnapshot?.data) throw new Error("Não foi possível interpretar os dados do Supabase.");
+      if (!remoteSnapshot?.data) throw new Error("Não foi possível interpretar os dados recebidos.");
       setSyncReview({
         mode: "merge",
-        fileName: `Supabase${payload.sourceDevice ? ` (${payload.sourceDevice})` : ""}`,
+        fileName: `Nuvem${payload.sourceDevice ? ` (${payload.sourceDevice})` : ""}`,
         incomingSettings: {
           teacherName: payload.teacherName ?? payload.settings?.teacherName,
           subjectName: payload.subjectName ?? payload.settings?.subjectName,
@@ -2398,13 +2397,13 @@ function App() {
       });
       setSelectedSyncSnapshotId(remoteSnapshot.id);
       if (!silent) {
-        setImportMessage("Encontramos dados diferentes no Supabase (provavelmente editados em outro aparelho). Revise antes de aplicar.");
+        setImportMessage("Encontramos dados diferentes na nuvem (provavelmente editados em outro aparelho). Revise antes de aplicar.");
       }
       setAutoSaveMessage("Alterações remotas aguardando sua revisão.");
       await refreshRemoteSnapshots();
       return false;
     } catch (error) {
-      if (!silent) setImportMessage(`Não foi possível carregar do Supabase: ${error?.message ?? "erro desconhecido"}`);
+      if (!silent) setImportMessage(`Não foi possível carregar os dados: ${error?.message ?? "erro desconhecido"}`);
       return false;
     } finally {
       setRemoteSyncLoading(false);
@@ -2417,7 +2416,7 @@ function App() {
     try {
       const record = await fetchSnapshotById(userId, snapshotId);
       if (!record?.payload?.data) {
-        setImportMessage("Não foi possível carregar essa versão do Supabase.");
+        setImportMessage("Não foi possível carregar essa versão.");
         return;
       }
       const validation = validateBackupData(record.payload.data);
@@ -2427,12 +2426,12 @@ function App() {
       }
       const remoteSnapshot = await verifySnapshotIntegrity(snapshotFromPayload(record.payload));
       if (!remoteSnapshot?.data) {
-        setImportMessage("Não foi possível interpretar essa versão do Supabase.");
+        setImportMessage("Não foi possível interpretar essa versão.");
         return;
       }
       setSyncReview({
         mode: "restore",
-        fileName: `Supabase - ${record.label ?? "versão selecionada"}`,
+        fileName: `Nuvem - ${record.label ?? "versão selecionada"}`,
         incomingSettings: {
           teacherName: record.payload.teacherName ?? record.payload.settings?.teacherName,
           subjectName: record.payload.subjectName ?? record.payload.settings?.subjectName,
@@ -2443,7 +2442,7 @@ function App() {
       setSelectedSyncSnapshotId(remoteSnapshot.id);
       setImportMessage("Revise a versão selecionada antes de restaurar.");
     } catch (error) {
-      setImportMessage(`Não foi possível carregar essa versão do Supabase: ${error?.message ?? "erro desconhecido"}`);
+      setImportMessage(`Não foi possível carregar essa versão: ${error?.message ?? "erro desconhecido"}`);
     } finally {
       setRemoteSyncLoading(false);
     }
@@ -2491,7 +2490,7 @@ function App() {
 
   async function saveToSupabase() {
     if (!supabaseStatus().configured) {
-      setImportMessage("Supabase não está configurado. Configure as variáveis de ambiente para sincronização remota.");
+      setImportMessage("Sincronização remota não está configurada.");
       return;
     }
     if (!userId) {
@@ -2505,7 +2504,7 @@ function App() {
     let directoryHandle = null;
     if (typeof window.showDirectoryPicker === "function") {
       const chooseDirectory = window.confirm(
-        "O caminho mais seguro é salvar primeiro localmente. Deseja ainda assim usar um backup existente de pasta para enviar ao Supabase? Clique em Cancelar para enviar o estado atual do aplicativo."
+        "O caminho mais seguro é salvar primeiro localmente. Deseja ainda assim usar um backup existente de pasta para enviar à nuvem? Clique em Cancelar para enviar o estado atual do aplicativo."
       );
       if (chooseDirectory) {
         try {
@@ -2545,11 +2544,11 @@ function App() {
       await saveRemoteState(userId, payload, { forceSnapshot: true });
       saveLastSyncedHash(payload.integrity?.hash);
       await refreshRemoteSnapshots();
-      setAutoSaveMessage("Dados salvos no Supabase com sucesso.");
+      setAutoSaveMessage("Dados salvos na nuvem com sucesso.");
       setAutoSaveFailed(false);
-      setImportMessage("Dados salvos com sucesso no Supabase.");
+      setImportMessage("Dados salvos com sucesso na nuvem.");
     } catch (error) {
-      setImportMessage(`Não foi possível salvar no Supabase: ${error?.message ?? "erro desconhecido"}`);
+      setImportMessage(`Não foi possível salvar na nuvem: ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
     } finally {
       setRemoteSyncLoading(false);
@@ -2566,10 +2565,10 @@ function App() {
       await saveRemoteState(userId, payload);
       saveLastSyncedHash(payload.integrity?.hash);
       await refreshRemoteSnapshots();
-      setAutoSaveMessage("Alteração salva no Supabase.");
+      setAutoSaveMessage("Alteração salva na nuvem.");
       setAutoSaveFailed(false);
     } catch (error) {
-      setAutoSaveMessage(`Não foi possível salvar no Supabase (dados mantidos só neste aparelho até a conexão voltar): ${error?.message ?? "erro desconhecido"}`);
+      setAutoSaveMessage(`Não foi possível salvar na nuvem (dados mantidos só neste aparelho até a conexão voltar): ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(await buildBackupPayload(true)));
@@ -2602,13 +2601,13 @@ function App() {
     }
     if (suppressNextAutoSaveRef.current) {
       suppressNextAutoSaveRef.current = false;
-      setAutoSaveMessage("Dados carregados do Supabase.");
+      setAutoSaveMessage("Dados carregados da nuvem.");
       return undefined;
     }
 
     window.clearTimeout(autoSaveTimerRef.current);
     if (!supabaseStatus().configured) {
-      setAutoSaveMessage("Salvo automaticamente neste aparelho. Configure o Supabase para sincronização remota.");
+      setAutoSaveMessage("Salvo automaticamente neste aparelho. Sincronização remota não configurada.");
       return undefined;
     }
 
@@ -4262,7 +4261,6 @@ function App() {
     }
 
     const resumoRows = [
-      ["Escola", SCHOOL_NAME],
       ["Professor", teacherName || ""],
       ["Disciplina", subjectName || ""],
       ["Período", exportLabel],
@@ -4618,7 +4616,6 @@ function App() {
   function buildConfiguredReportRows(presetId, exportPeriod, options = {}) {
     const reportLabel = presetId === "attendance" && options.attendanceScope === "month" ? formatMonthKey(options.month) : periodLabel(exportPeriod);
     const baseRows = [
-      ["Escola", SCHOOL_NAME],
       ["Professor", teacherName || ""],
       ["Disciplina", subjectName || ""],
       ["Período", reportLabel],
@@ -4908,7 +4905,7 @@ function App() {
             @page { size: A4; margin: 12mm; }
             * { box-sizing: border-box; }
             body { color: #102f1a; font-family: Arial, sans-serif; margin: 0; }
-            header { align-items: center; border-bottom: 4px solid #f2a900; display: flex; gap: 12px; margin-bottom: 16px; padding-bottom: 12px; }
+            header { align-items: center; border-bottom: 4px solid #f5a623; display: flex; gap: 12px; margin-bottom: 16px; padding-bottom: 12px; }
             .report-logo { height: 58px; object-fit: contain; width: 58px; }
             .report-heading { min-width: 0; }
             h1 { color: #0b3f1c; font-size: 22px; margin: 0 0 6px; }
@@ -4928,9 +4925,9 @@ function App() {
         </head>
         <body>
           <header>
-            <img class="report-logo" alt="CAp UFRJ" src="${SCHOOL_LOGO_SRC}" />
+            <img class="report-logo" alt="Meu Diário" src="${APP_LOGO_SRC}" />
             <div class="report-heading">
-              <h1>${SCHOOL_NAME} - ${APP_TITLE}</h1>
+              <h1>${APP_TITLE}</h1>
               <p class="meta">Professor: ${escapeHtml(teacherName || "Não informado")}</p>
               <p class="meta">Disciplina: ${escapeHtml(subjectName || "Não informada")}</p>
               <p class="meta">Período: ${reportLabel}</p>
@@ -4969,7 +4966,7 @@ function App() {
             @page { size: A4 landscape; margin: 10mm; }
             * { box-sizing: border-box; }
             body { color: #102f1a; font-family: Arial, sans-serif; margin: 0; }
-            header { align-items: center; border-bottom: 4px solid #f2a900; display: flex; gap: 12px; margin-bottom: 14px; padding-bottom: 10px; }
+            header { align-items: center; border-bottom: 4px solid #f5a623; display: flex; gap: 12px; margin-bottom: 14px; padding-bottom: 10px; }
             .report-logo { height: 54px; object-fit: contain; width: 54px; }
             .report-heading { min-width: 0; }
             h1 { color: #0b3f1c; font-size: 22px; margin: 0 0 6px; }
@@ -4986,7 +4983,7 @@ function App() {
         </head>
         <body>
           <header>
-            <img class="report-logo" alt="CAp UFRJ" src="${SCHOOL_LOGO_SRC}" />
+            <img class="report-logo" alt="Meu Diário" src="${APP_LOGO_SRC}" />
             <div class="report-heading">
               <h1>${escapeHtml(report.title)}</h1>
               ${metadataRows.map(([label, value]) => `<p class="meta">${escapeHtml(label)}: ${escapeHtml(value || (label === "Professor" ? "Não informado" : label === "Disciplina" ? "Não informada" : ""))}</p>`).join("")}
@@ -5231,7 +5228,7 @@ function App() {
       {authLoading && (
         <section className="auth-shell auth-shell-quick" aria-label="Carregando">
           <div className="auth-quick-card">
-            <img className="auth-quick-logo" alt={SCHOOL_NAME} src={SCHOOL_LOGO_SRC} />
+            <img className="auth-quick-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
             <p className="eyebrow">{APP_TITLE}</p>
             <h1>Carregando...</h1>
           </div>
@@ -5240,7 +5237,7 @@ function App() {
       {!authLoading && recoveryMode && (
         <section className="auth-shell auth-shell-quick" aria-label="Redefinir senha">
           <form className="auth-quick-card" onSubmit={handleUpdateRecoveryPassword}>
-            <img className="auth-quick-logo" alt={SCHOOL_NAME} src={SCHOOL_LOGO_SRC} />
+            <img className="auth-quick-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
             <p className="eyebrow">Recuperação de acesso</p>
             <h1>Definir nova senha</h1>
             <label>
@@ -5280,16 +5277,15 @@ function App() {
       {!authLoading && !recoveryMode && !appUnlocked && (
         <section className="auth-shell" aria-label={authTab === "signup" ? "Cadastro do diário" : "Login do diário"}>
           <div className="auth-visual">
-            <img className="auth-visual-logo" alt={SCHOOL_NAME} src={SCHOOL_LOGO_SRC} />
-            <p className="auth-visual-eyebrow">{SCHOOL_NAME}</p>
+            <img className="auth-visual-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
             <h1>{APP_TITLE}</h1>
             <p className="auth-visual-subtitle">Turmas, notas, frequência e recuperação em um só lugar.</p>
             <ul className="auth-visual-bullets">
               <li><CheckCircle2 size={18} /><span>Notas, faltas e recuperação organizadas por trimestre</span></li>
-              <li><CheckCircle2 size={18} /><span>Sincronização entre dispositivos via Supabase</span></li>
+              <li><CheckCircle2 size={18} /><span>Sincronização automática entre dispositivos</span></li>
               <li><CheckCircle2 size={18} /><span>Backup automático com histórico de versões</span></li>
             </ul>
-            <p className="auth-visual-footer">Login com e-mail e senha via Supabase Auth. Cada professor vê só o próprio diário.</p>
+            <p className="auth-visual-footer">Login com e-mail e senha. Cada professor vê só o próprio diário.</p>
           </div>
           <div className="auth-panel">
             <div className="auth-panel-inner">
@@ -5443,7 +5439,7 @@ function App() {
         <section className="auth-shell auth-shell-quick" aria-label="Desbloqueio rápido">
           {!appLockPinHash ? (
             <form className="auth-quick-card" onSubmit={submitCreatePin}>
-              <img className="auth-quick-logo" alt={SCHOOL_NAME} src={SCHOOL_LOGO_SRC} />
+              <img className="auth-quick-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
               <p className="eyebrow">{APP_TITLE}</p>
               <h1>Criar PIN de desbloqueio</h1>
               <p className="helper-text">Esse PIN fica só neste aparelho e permite abrir o app rapidamente, mesmo sem internet.</p>
@@ -5488,7 +5484,7 @@ function App() {
             </form>
           ) : (
             <form className="auth-quick-card" onSubmit={submitCheckPin}>
-              <img className="auth-quick-logo" alt={SCHOOL_NAME} src={SCHOOL_LOGO_SRC} />
+              <img className="auth-quick-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
               <p className="eyebrow">{APP_TITLE}</p>
               <h1>Bem-vindo(a) de volta{teacherName ? `, ${teacherName}` : ""}</h1>
               <label>
@@ -6082,19 +6078,19 @@ function App() {
                   <h2>Backup remoto</h2>
                   <p>
                     {supabaseInfo.configured
-                      ? `Sincronização remota ativa no Supabase: ${supabaseInfo.url}`
-                      : "Supabase não está configurado. Defina VITE_SUPABASE_URL e VITE_SUPABASE_ANON_KEY para ativar sincronização remota."}
+                      ? "Sincronização remota ativa."
+                      : "Sincronização remota não está configurada."}
                   </p>
                   <small>
-                    Os dados do diário são salvos no Supabase e podem ser carregados de outros dispositivos com a mesma configuração.
+                    Os dados do diário são salvos na nuvem e podem ser carregados em outros dispositivos com a mesma conta.
                   </small>
                 </div>
                 <div className="settings-backup-actions">
                   <button className="secondary" type="button" disabled={remoteSyncLoading || !supabaseInfo.configured} onClick={() => loadLatestFromSupabase({ silent: false })}>
-                    Atualizar do Supabase
+                    Atualizar da nuvem
                   </button>
                   <button className="secondary" type="button" disabled={remoteSyncLoading || !supabaseInfo.configured} onClick={() => saveToSupabase()}>
-                    Salvar no Supabase
+                    Salvar na nuvem
                   </button>
                 </div>
                 <div className="settings-backup-actions">
@@ -6112,7 +6108,7 @@ function App() {
                 </div>
                 {remoteSnapshots.length > 0 && (
                   <div className="sync-folder-version-list">
-                    <strong>Últimas versões no Supabase</strong>
+                    <strong>Últimas versões salvas</strong>
                     {remoteSnapshots.slice(0, SYNC_HISTORY_LIMIT + 1).map((snapshot) => (
                       <div className="sync-version-row" key={snapshot.id}>
                         <span>
@@ -6163,9 +6159,9 @@ function App() {
       )}
       <header className="topbar">
         <div className="brand-heading">
-          <img className="school-logo" alt="CAp UFRJ" src={SCHOOL_LOGO_SRC} />
+          <img className="school-logo" alt="Meu Diário" src={APP_LOGO_SRC} />
           <div>
-          <p className="eyebrow">Sincronização remota via Supabase</p>
+          <p className="eyebrow">Sincronização automática em nuvem</p>
           <h1>{APP_TITLE}</h1>
           <p className="app-version">Versão {APP_VERSION}</p>
           <p className="teacher-name">Professor: {teacherName || "Não informado"}</p>
