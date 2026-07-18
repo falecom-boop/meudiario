@@ -2298,6 +2298,7 @@ function App() {
   const [syncReview, setSyncReview] = useState(null);
   const [selectedSyncSnapshotId, setSelectedSyncSnapshotId] = useState("");
   const [autoSaveMessage, setAutoSaveMessage] = useState("");
+  const [autoSaveFailed, setAutoSaveFailed] = useState(false);
   const [gradeDecimals, setGradeDecimals] = useState(loadGradeDecimals);
   const [deviceId] = useState(loadDeviceId);
   const [draggingClassId, setDraggingClassId] = useState("");
@@ -2545,9 +2546,11 @@ function App() {
       saveLastSyncedHash(payload.integrity?.hash);
       await refreshRemoteSnapshots();
       setAutoSaveMessage("Dados salvos no Supabase com sucesso.");
+      setAutoSaveFailed(false);
       setImportMessage("Dados salvos com sucesso no Supabase.");
     } catch (error) {
       setImportMessage(`Não foi possível salvar no Supabase: ${error?.message ?? "erro desconhecido"}`);
+      setAutoSaveFailed(true);
     } finally {
       setRemoteSyncLoading(false);
     }
@@ -2557,14 +2560,17 @@ function App() {
     if (!supabaseStatus().configured || !userId) return;
     if (autoSaveInFlightRef.current) return;
     autoSaveInFlightRef.current = true;
+    window.clearTimeout(autoSaveTimerRef.current);
     try {
       const payload = await buildBackupPayload(true);
       await saveRemoteState(userId, payload);
       saveLastSyncedHash(payload.integrity?.hash);
       await refreshRemoteSnapshots();
       setAutoSaveMessage("Alteração salva no Supabase.");
+      setAutoSaveFailed(false);
     } catch (error) {
-      setAutoSaveMessage(`Não foi possível salvar no Supabase: ${error?.message ?? "erro desconhecido"}`);
+      setAutoSaveMessage(`Não foi possível salvar no Supabase (dados mantidos só neste aparelho até a conexão voltar): ${error?.message ?? "erro desconhecido"}`);
+      setAutoSaveFailed(true);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(await buildBackupPayload(true)));
       } catch {
@@ -2613,6 +2619,35 @@ function App() {
 
     return () => window.clearTimeout(autoSaveTimerRef.current);
   }, [data, teacherName, subjectName, gradeDecimals, appUnlocked]);
+
+  useEffect(() => {
+    if (!appUnlocked) return undefined;
+    function flushPendingAutoSave() {
+      if (autoSaveTimerRef.current) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = 0;
+        autoSaveToSupabase();
+      }
+    }
+    function handleVisibilityChange() {
+      if (document.visibilityState === "hidden") flushPendingAutoSave();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("pagehide", flushPendingAutoSave);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("pagehide", flushPendingAutoSave);
+    };
+  }, [appUnlocked]);
+
+  useEffect(() => {
+    if (!appUnlocked) return undefined;
+    function handleOnline() {
+      if (autoSaveFailed) autoSaveToSupabase();
+    }
+    window.addEventListener("online", handleOnline);
+    return () => window.removeEventListener("online", handleOnline);
+  }, [appUnlocked, autoSaveFailed]);
 
   useEffect(() => {
     if (teacherName) {
@@ -6062,6 +6097,19 @@ function App() {
                     Salvar no Supabase
                   </button>
                 </div>
+                <div className="settings-backup-actions">
+                  <button
+                    className="secondary"
+                    type="button"
+                    onClick={() => {
+                      if (window.confirm("Sair da conta neste navegador?")) {
+                        supabaseSignOut();
+                      }
+                    }}
+                  >
+                    Sair da conta
+                  </button>
+                </div>
                 {remoteSnapshots.length > 0 && (
                   <div className="sync-folder-version-list">
                     <strong>Últimas versões no Supabase</strong>
@@ -6185,8 +6233,13 @@ function App() {
 
       <section className={showTermEditor ? "period-panel editing" : "period-panel"} aria-label="Período do diário">
         {autoSaveMessage && !importMessage && (
-          <div className="notice autosave-notice" role="status">
+          <div className={`notice autosave-notice${autoSaveFailed ? " warning" : ""}`} role="status">
             {autoSaveMessage}
+            {autoSaveFailed && (
+              <button className="secondary" type="button" onClick={() => autoSaveToSupabase()}>
+                Tentar novamente
+              </button>
+            )}
           </div>
         )}
         <div className="period-main">
