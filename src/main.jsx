@@ -54,10 +54,6 @@ const SCHOOL_NAME = "CAp UFRJ";
 const APP_TITLE = "Diário de Classe";
 const APP_VERSION = "1.2";
 const SCHOOL_LOGO_SRC = "cap-ufrj-logo.svg";
-// Guardamos apenas o hash SHA-256 dessa senha (não o texto puro) para que ela não
-// fique legível dentro do app instalado/compilado. Gere o hash com
-// supabase/gerar-hash-senha.html e cole o resultado no .env.
-const ADMIN_PASSWORD_HASH = (import.meta.env.VITE_ADMIN_PASSWORD_HASH ?? "").trim().toLowerCase();
 const ATTENDANCE_NOT_TAKEN = "not-taken";
 const DEFAULT_GRADE_DECIMALS = 1;
 let activeGradeDecimals = DEFAULT_GRADE_DECIMALS;
@@ -339,11 +335,6 @@ async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(text ?? "");
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-async function checkAdminPassword(candidate) {
-  if (!ADMIN_PASSWORD_HASH) return false;
-  return (await sha256Hex(candidate ?? "")) === ADMIN_PASSWORD_HASH;
 }
 
 function stableStringify(value) {
@@ -2983,13 +2974,15 @@ function App() {
     if (!selectedClass) return;
     const ok = window.confirm(`Remover "${selectedClass.name}" e todos os alunos dessa turma?`);
     if (!ok) return;
-    if (!ADMIN_PASSWORD_HASH) {
-      setImportMessage("Senha de administrador não configurada (defina VITE_ADMIN_PASSWORD_HASH no .env). Turma mantida.");
+    const password = window.prompt("Digite sua senha para confirmar a exclusão da turma:");
+    if (!password) {
+      setImportMessage("Exclusão cancelada. Turma mantida.");
       return;
     }
-    const password = window.prompt("Digite a senha de administrador para remover a turma:");
-    if (!(await checkAdminPassword(password))) {
-      setImportMessage("Senha de administrador incorreta. Turma mantida.");
+    try {
+      await signInWithEmail(session?.user?.email, password);
+    } catch (error) {
+      setImportMessage("Senha incorreta. Turma mantida.");
       return;
     }
     setData((current) => ({
