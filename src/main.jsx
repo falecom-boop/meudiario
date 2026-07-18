@@ -5870,7 +5870,7 @@ function App() {
           </div>
         </section>
       )}
-      {syncReview && selectedSyncSummary && (
+      {syncReview && selectedSyncSummary && !pendingJsonImport && (
         <section className="teacher-gate" aria-label="Revisar sincronização">
           <div className="import-review-card sync-review-card">
             <div className="import-review-header">
