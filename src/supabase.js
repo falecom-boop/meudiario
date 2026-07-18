@@ -127,3 +127,19 @@ export async function createSnapshot(userId, snapshot) {
   if (error) throw error;
   return data?.[0] ?? null;
 }
+
+export async function pruneOldSnapshots(userId, keep = 30) {
+  const { data: rows, error } = await requireClient()
+    .from(SNAPSHOT_TABLE)
+    .select("id")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .range(keep, keep + 500);
+  if (error) throw error;
+  if (!rows?.length) return;
+  const { error: deleteError } = await requireClient()
+    .from(SNAPSHOT_TABLE)
+    .delete()
+    .in("id", rows.map((row) => row.id));
+  if (deleteError) throw deleteError;
+}

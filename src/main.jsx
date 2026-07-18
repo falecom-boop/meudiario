@@ -23,6 +23,7 @@ import {
   fetchLatestSnapshots,
   fetchSnapshotById,
   createSnapshot,
+  pruneOldSnapshots,
   supabaseStatus,
   signUpWithEmail,
   signInWithEmail,
@@ -42,6 +43,9 @@ const GRADE_DECIMALS_KEY = "checkout-turmas:grade-decimals";
 const DEVICE_ID_KEY = "checkout-turmas:device-id";
 const SYNC_HISTORY_KEY = "checkout-turmas:sync-history";
 const LAST_SYNCED_HASH_KEY = "checkout-turmas:last-synced-hash";
+const LAST_SNAPSHOT_AT_KEY = "checkout-turmas:last-snapshot-at";
+const SNAPSHOT_MIN_INTERVAL_MS = 30 * 60 * 1000;
+const SNAPSHOT_KEEP_LIMIT = 30;
 const APP_LOCK_PIN_HASH_KEY = "checkout-turmas:app-lock-pin-hash";
 const SYNC_SCHEMA_VERSION = 2;
 const SYNC_HISTORY_LIMIT = 4;
@@ -527,6 +531,23 @@ function saveLastSyncedHash(hash) {
   }
 }
 
+function shouldCreateSnapshot() {
+  try {
+    const lastAt = Number(localStorage.getItem(LAST_SNAPSHOT_AT_KEY) ?? 0);
+    return Date.now() - lastAt >= SNAPSHOT_MIN_INTERVAL_MS;
+  } catch {
+    return true;
+  }
+}
+
+function markSnapshotCreated() {
+  try {
+    localStorage.setItem(LAST_SNAPSHOT_AT_KEY, String(Date.now()));
+  } catch {
+    // Ignorar falha ao gravar o marcador de snapshot
+  }
+}
+
 function loadDeviceId() {
   try {
     const stored = localStorage.getItem(DEVICE_ID_KEY);
@@ -558,10 +579,11 @@ async function loadRemoteState(userId) {
   }
 }
 
-async function saveRemoteState(userId, payload) {
+async function saveRemoteState(userId, payload, { forceSnapshot = false } = {}) {
   if (!supabaseStatus().configured) throw new Error("Supabase não está configurado.");
   if (!userId) throw new Error("Nenhum professor autenticado.");
   await saveCurrentState(userId, payload);
+  if (!forceSnapshot && !shouldCreateSnapshot()) return;
   try {
     await createSnapshot(userId, {
       id: payload.snapshotId,
@@ -574,6 +596,8 @@ async function saveRemoteState(userId, payload) {
       sync_schema_version: payload.syncSchemaVersion,
       payload
     });
+    markSnapshotCreated();
+    await pruneOldSnapshots(userId, SNAPSHOT_KEEP_LIMIT);
   } catch (error) {
     console.warn("Não foi possível salvar snapshot no Supabase:", error);
   }
@@ -2525,7 +2549,7 @@ function App() {
         }
       }
 
-      await saveRemoteState(userId, payload);
+      await saveRemoteState(userId, payload, { forceSnapshot: true });
       saveLastSyncedHash(payload.integrity?.hash);
       await refreshRemoteSnapshots();
       setAutoSaveMessage("Dados salvos no Supabase com sucesso.");
@@ -6136,6 +6160,16 @@ function App() {
                 Frequência
                 <span>Excel ou CSV</span>
                 <input accept=".xlsx,.xls,.xlse,.csv,.txt" type="file" onChange={importAttendance} />
+              </label>
+              <label className="menu-file-button">
+                Backup (.json) — Mesclar
+                <span>Junta com o que já está aqui, sem apagar nada</span>
+                <input accept=".json" type="file" onChange={(event) => importBackup(event, "merge")} />
+              </label>
+              <label className="menu-file-button">
+                Backup (.json) — Restaurar
+                <span>Substitui os dados atuais pelo arquivo escolhido</span>
+                <input accept=".json" type="file" onChange={(event) => importBackup(event, "restore")} />
               </label>
             </div>
           </details>
