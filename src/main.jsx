@@ -49,7 +49,7 @@ const SNAPSHOT_KEEP_LIMIT = 30;
 const APP_LOCK_PIN_HASH_KEY = "checkout-turmas:app-lock-pin-hash";
 const SYNC_SCHEMA_VERSION = 2;
 const SYNC_HISTORY_LIMIT = 4;
-const AUTO_SYNC_DELAY_MS = 8000;
+const AUTO_SYNC_DELAY_MS = 2000;
 const APP_TITLE = "Meu Diário";
 const APP_VERSION = "2";
 const APP_LOGO_SRC = "icon.png";
@@ -2714,6 +2714,23 @@ function App() {
       window.removeEventListener("pagehide", flushPendingAutoSave);
     };
   }, [appUnlocked]);
+
+  useEffect(() => {
+    if (!appUnlocked) return undefined;
+    // O navegador pode abortar o envio pro Supabase no meio se a aba fechar
+    // rápido demais (o diário costuma passar de 500KB, grande demais pros
+    // mecanismos de "enviar mesmo fechando" do navegador, que só garantem
+    // até 64KB). Por isso, se ainda houver algo pendente de enviar, avisamos
+    // antes de fechar em vez de arriscar perder a alteração silenciosamente.
+    function handleBeforeUnload(event) {
+      const pending = !!autoSaveTimerRef.current || autoSaveInFlightRef.current || autoSaveFailed;
+      if (!pending) return;
+      event.preventDefault();
+      event.returnValue = "";
+    }
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, [appUnlocked, autoSaveFailed]);
 
   useEffect(() => {
     if (!appUnlocked) return undefined;
