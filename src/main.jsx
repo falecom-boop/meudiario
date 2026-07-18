@@ -2253,6 +2253,7 @@ function App() {
   const appUnlocked = !!session;
   const userId = session?.user?.id ?? null;
   const [pendingGradeImport, setPendingGradeImport] = useState(null);
+  const [pendingJsonImport, setPendingJsonImport] = useState(null);
   const [pendingAttendanceImport, setPendingAttendanceImport] = useState(null);
   const [teacherName, setTeacherName] = useState(loadTeacherName);
   const [teacherDraft, setTeacherDraft] = useState(loadTeacherName);
@@ -2558,53 +2559,6 @@ function App() {
       setImportMessage(`Não foi possível salvar no Supabase: ${error?.message ?? "erro desconhecido"}`);
     } finally {
       setRemoteSyncLoading(false);
-    }
-  }
-
-  async function restoreLocalBackup() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) {
-        setImportMessage("Nenhum backup local encontrado.");
-        return false;
-      }
-
-      const confirmation = window.confirm(
-        "Atenção: esta ação substituirá os dados atuais. Deseja restaurar o backup local?"
-      );
-      if (!confirmation) {
-        setImportMessage("Restauração local cancelada.");
-        return false;
-      }
-
-      const payload = JSON.parse(raw);
-      const validation = validateBackupData(payload?.data ?? payload);
-      if (!validation.valid) {
-        setImportMessage(`Backup local inválido: ${validation.message}`);
-        return false;
-      }
-
-      const loadedData = migrateData(payload.data ?? payload);
-      suppressNextAutoSaveRef.current = true;
-      setData(loadedData);
-      setSelectedClassId(loadedData.classes[0]?.id ?? "");
-      if (typeof payload.teacherName === "string") {
-        setTeacherName(payload.teacherName);
-      }
-      if (typeof payload.subjectName === "string") {
-        setSubjectName(payload.subjectName);
-      }
-      const decimals = Number(payload.settings?.gradeDecimals ?? payload.gradeDecimals);
-      if ([0, 1, 2].includes(decimals)) {
-        setGradeDecimals(decimals);
-      }
-
-      setAutoSaveMessage("Dados restaurados do backup local.");
-      setImportMessage("Backup local restaurado com sucesso.");
-      return true;
-    } catch (error) {
-      setImportMessage(`Falha ao restaurar backup local: ${error?.message ?? "erro desconhecido"}`);
-      return false;
     }
   }
 
@@ -3751,13 +3705,30 @@ function App() {
     setImportMessage(`Backup restaurado: ${selectedSnapshot.label}. Uma cópia de segurança anterior foi guardada no histórico local.`);
   }
 
-  async function importBackup(event, mode = "restore") {
+  async function handleJsonFileSelected(event) {
     const file = event.target.files?.[0];
     event.target.value = "";
     if (!file) return;
 
     try {
       const payload = JSON.parse(await file.text());
+      const validation = validateBackupData(payload.data ?? payload);
+      if (!validation.valid) {
+        setImportMessage(`Arquivo inválido: ${validation.message}`);
+        return;
+      }
+      setPendingJsonImport({ fileName: file.name, payload });
+    } catch (error) {
+      setImportMessage(`Não foi possível ler o arquivo: ${error?.message ?? "arquivo inválido"}`);
+    }
+  }
+
+  async function applyJsonImport(mode) {
+    if (!pendingJsonImport) return;
+    const payload = pendingJsonImport.payload;
+    setPendingJsonImport(null);
+
+    try {
       const backupData = migrateData(payload.data ?? payload);
       const incomingSettings = payload.settings ?? payload;
       const localSafetySnapshot = createSyncSnapshot({
@@ -3770,8 +3741,6 @@ function App() {
       });
       const incomingSnapshots = snapshotsFromPayload(payload);
       if (mode === "merge") {
-        const ok = window.confirm("Sincronizar este arquivo com os dados atuais? O app vai juntar turmas, alunos, aulas, avaliações e notas sem apagar o que já existe neste aparelho.");
-        if (!ok) return;
         saveSyncHistory([localSafetySnapshot, ...incomingSnapshots, ...loadSyncHistory()]);
         const result = mergeBackupData(data, backupData);
         setData(result.data);
@@ -3815,8 +3784,6 @@ function App() {
         restoreSnapshot = incomingSnapshots[selectedIndex];
       }
 
-      const ok = window.confirm(`Restaurar "${restoreSnapshot?.label ?? "arquivo escolhido"}"? Isso substitui os dados atuais deste aparelho. Use apenas se quiser voltar exatamente à versão escolhida.`);
-      if (!ok) return;
       saveSyncHistory([localSafetySnapshot, ...incomingSnapshots, ...loadSyncHistory()]);
       const restoreData = migrateData(restoreSnapshot?.data ?? backupData);
       setData(restoreData);
@@ -5524,6 +5491,35 @@ function App() {
           )}
         </section>
       )}
+      {pendingJsonImport && (
+        <section className="teacher-gate" aria-label="Importar backup .json">
+          <div className="import-review-card">
+            <div className="import-review-header">
+              <div>
+                <p className="eyebrow">Importar backup</p>
+                <h1>{pendingJsonImport.fileName}</h1>
+              </div>
+              <button className="secondary" type="button" onClick={() => setPendingJsonImport(null)}>
+                Cancelar
+              </button>
+            </div>
+            <div className="import-review-body">
+              <p>Como você quer usar esse arquivo?</p>
+              <div className="import-review-counts">
+                <button className="primary-action" type="button" onClick={() => applyJsonImport("merge")}>
+                  Mesclar dados
+                </button>
+                <button className="primary-action" type="button" onClick={() => applyJsonImport("restore")}>
+                  Reescrever
+                </button>
+              </div>
+              <p className="helper-text">
+                <strong>Mesclar dados</strong> junta turmas, alunos, aulas, avaliações e notas com o que já está aqui, sem apagar nada. <strong>Reescrever</strong> substitui os dados atuais deste aparelho pelo conteúdo do arquivo.
+              </p>
+            </div>
+          </div>
+        </section>
+      )}
       {pendingGradeImport && (
         <section className="teacher-gate" aria-label="Revisão da importação de notas">
           <div className="import-review-card">
@@ -6162,14 +6158,9 @@ function App() {
                 <input accept=".xlsx,.xls,.xlse,.csv,.txt" type="file" onChange={importAttendance} />
               </label>
               <label className="menu-file-button">
-                Backup (.json) — Mesclar
-                <span>Junta com o que já está aqui, sem apagar nada</span>
-                <input accept=".json" type="file" onChange={(event) => importBackup(event, "merge")} />
-              </label>
-              <label className="menu-file-button">
-                Backup (.json) — Restaurar
-                <span>Substitui os dados atuais pelo arquivo escolhido</span>
-                <input accept=".json" type="file" onChange={(event) => importBackup(event, "restore")} />
+                Backup (.json)
+                <span>Escolha um arquivo salvo neste ou em outro aparelho</span>
+                <input accept=".json" type="file" onChange={handleJsonFileSelected} />
               </label>
             </div>
           </details>
@@ -6180,10 +6171,6 @@ function App() {
           <button className="primary-action" type="button" disabled={remoteSyncLoading} onClick={() => loadLatestFromSupabase({ silent: false })}>
             <RefreshCw size={18} />
             Atualizar
-          </button>
-          <button className="primary-action" type="button" disabled={remoteSyncLoading} onClick={() => restoreLocalBackup()}>
-            <Share2 size={18} />
-            Restaurar backup local
           </button>
           <button className="icon-settings" type="button" onClick={openSettings} aria-label="Configurações">
             <Pencil size={18} />
