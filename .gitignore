@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+release/
+
+# Local tooling (portable JDK etc. - multi-GB, machine-specific)
+.tools/
+
+# Local backups / restore points (already covered by git history)
+restore-points/
+android-smoke-output/
+
+# Secrets - never commit real credentials
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+
+# Packaged app binaries (large, generated)
+*.apk
+
+# Android build artifacts (keep the rest of android/ tracked)
+android/app/build/
+android/build/
+android/.gradle/
+android/local.properties
+android/capacitor-cordova-android-plugins/build/
+
+# Editor/OS cruft
+.DS_Store
+Thumbs.db
