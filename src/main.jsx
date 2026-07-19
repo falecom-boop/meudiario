@@ -2388,6 +2388,7 @@ function App() {
   const [selectedSyncSnapshotId, setSelectedSyncSnapshotId] = useState("");
   const [autoSaveMessage, setAutoSaveMessage] = useState("");
   const [autoSaveFailed, setAutoSaveFailed] = useState(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
   const [gradeDecimals, setGradeDecimals] = useState(loadGradeDecimals);
   const [deviceId] = useState(loadDeviceId);
   const [draggingClassId, setDraggingClassId] = useState("");
@@ -2710,10 +2711,12 @@ function App() {
       }
       setAutoSaveMessage("Dados salvos na nuvem com sucesso.");
       setAutoSaveFailed(false);
+      setHasUnsavedChanges(false);
       setImportMessage("Dados salvos com sucesso na nuvem.");
     } catch (error) {
       setImportMessage(`Não foi possível salvar na nuvem: ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
+      setHasUnsavedChanges(true);
     } finally {
       setRemoteSyncLoading(false);
     }
@@ -2741,6 +2744,7 @@ function App() {
       lastSavedDataRef.current = merged;
       pendingActionCountRef.current = 0;
       lastCompactionAtRef.current = Date.now();
+      setHasUnsavedChanges(false);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       } catch {
@@ -2762,6 +2766,7 @@ function App() {
       const patch = diffData(lastSavedDataRef.current ?? migratedNext, migratedNext);
       if (isPatchEmpty(patch)) {
         setAutoSaveFailed(false);
+        setHasUnsavedChanges(false);
         return;
       }
       await appendAction(userId, patch);
@@ -2777,6 +2782,7 @@ function App() {
       }
       setAutoSaveMessage("Alteração salva na nuvem.");
       setAutoSaveFailed(false);
+      setHasUnsavedChanges(false);
       const shouldCompact =
         pendingActionCountRef.current >= ACTION_COMPACTION_THRESHOLD ||
         Date.now() - lastCompactionAtRef.current >= COMPACTION_INTERVAL_MS;
@@ -2786,6 +2792,7 @@ function App() {
     } catch (error) {
       setAutoSaveMessage(`Não foi possível salvar na nuvem (dados mantidos só neste aparelho até a conexão voltar): ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
+      setHasUnsavedChanges(true);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(await buildBackupPayload(true)));
       } catch {
@@ -2804,6 +2811,8 @@ function App() {
   const lastCompactionAtRef = useRef(Date.now());
   const appendActionRef = useRef(appendActionToSupabase);
   appendActionRef.current = appendActionToSupabase;
+  const hasUnsavedChangesRef = useRef(hasUnsavedChanges);
+  hasUnsavedChangesRef.current = hasUnsavedChanges;
   activeGradeDecimals = gradeDecimals;
 
   useEffect(() => {
@@ -2824,6 +2833,7 @@ function App() {
     if (suppressNextAutoSaveRef.current) {
       suppressNextAutoSaveRef.current = false;
       setAutoSaveMessage("Dados carregados da nuvem.");
+      setHasUnsavedChanges(false);
       return undefined;
     }
 
@@ -2834,6 +2844,7 @@ function App() {
     }
 
     setAutoSaveMessage("Alteração salva neste aparelho. Sincronização remota agendada...");
+    setHasUnsavedChanges(true);
     autoSaveTimerRef.current = window.setTimeout(() => {
       appendActionToSupabase();
     }, AUTO_SYNC_DELAY_MS);
@@ -2851,7 +2862,14 @@ function App() {
       }
     }
     function handleVisibilityChange() {
-      if (document.visibilityState === "hidden") flushPendingAutoSave();
+      if (document.visibilityState === "hidden") {
+        flushPendingAutoSave();
+      } else if (document.visibilityState === "visible" && hasUnsavedChangesRef.current) {
+        // Se ainda havia algo pendente quando a aba ficou escondida (ex.: sem
+        // internet no momento), tenta de novo assim que o usuário volta —
+        // sem esperar o professor perceber e clicar em "Tentar novamente".
+        appendActionRef.current();
+      }
     }
     document.addEventListener("visibilitychange", handleVisibilityChange);
     window.addEventListener("pagehide", flushPendingAutoSave);
@@ -6483,6 +6501,28 @@ function App() {
               </label>
             </div>
           </details>
+          {supabaseInfo.configured && appUnlocked && (
+            <span
+              className={`sync-status-pill${autoSaveFailed ? " failed" : hasUnsavedChanges ? " pending" : " saved"}`}
+              role="status"
+              title={
+                autoSaveFailed
+                  ? "Não foi possível salvar na nuvem. Toque em Salvar antes de sair."
+                  : hasUnsavedChanges
+                    ? "Salvando alteração na nuvem..."
+                    : "Tudo salvo na nuvem. Pode sair com segurança."
+              }
+            >
+              {autoSaveFailed ? (
+                <Info size={14} />
+              ) : hasUnsavedChanges ? (
+                <Clock3 size={14} />
+              ) : (
+                <CheckCircle2 size={14} />
+              )}
+              {autoSaveFailed ? "Falha ao salvar" : hasUnsavedChanges ? "Salvando..." : "Tudo salvo"}
+            </span>
+          )}
           <button className="primary-action save-action" type="button" disabled={remoteSyncLoading} onClick={() => saveToSupabase()}>
             <Download size={18} />
             {remoteSyncLoading ? "Salvando..." : "Salvar"}
