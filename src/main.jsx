@@ -2846,6 +2846,7 @@ function App() {
     setAutoSaveMessage("Alteração salva neste aparelho. Sincronização remota agendada...");
     setHasUnsavedChanges(true);
     autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = 0;
       appendActionToSupabase();
     }, AUTO_SYNC_DELAY_MS);
 
@@ -2887,14 +2888,14 @@ function App() {
     // até 64KB). Por isso, se ainda houver algo pendente de enviar, avisamos
     // antes de fechar em vez de arriscar perder a alteração silenciosamente.
     function handleBeforeUnload(event) {
-      const pending = !!autoSaveTimerRef.current || autoSaveInFlightRef.current || compactionInFlightRef.current || autoSaveFailed;
+      const pending = hasUnsavedChanges || autoSaveInFlightRef.current || compactionInFlightRef.current || autoSaveFailed;
       if (!pending) return;
       event.preventDefault();
       event.returnValue = "";
     }
     window.addEventListener("beforeunload", handleBeforeUnload);
     return () => window.removeEventListener("beforeunload", handleBeforeUnload);
-  }, [appUnlocked, autoSaveFailed]);
+  }, [appUnlocked, autoSaveFailed, hasUnsavedChanges]);
 
   useEffect(() => {
     if (!appUnlocked) return undefined;
