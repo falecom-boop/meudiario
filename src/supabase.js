@@ -12,7 +12,10 @@ function isSupabaseConfigured() {
 
 export const supabase = isSupabaseConfigured()
   ? createClient(SUPABASE_URL, SUPABASE_KEY, {
-      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true }
+      // sessionStorage (não localStorage): a sessão dura enquanto a aba/janela
+      // fica aberta, mas some ao fechar — assim fechar e reabrir sempre pede
+      // login de novo, deixando claro que o login é real.
+      auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: true, storage: window.sessionStorage }
     })
   : null;
 
