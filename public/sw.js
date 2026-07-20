@@ -1,5 +1,5 @@
-const CACHE_NAME = "meu-diario-v10";
-const STATIC_ASSETS = ["/", "/index.html", "/manifest.webmanifest", "/icon.png"];
+const CACHE_NAME = "meu-diario-v11";
+const STATIC_ASSETS = ["/", "/index.html", "/icon.png", "/icon-192.png", "/icon-512.png"];
 const IS_LOCAL_DEV = self.location.hostname === "localhost" || self.location.hostname === "127.0.0.1";
 
 self.addEventListener("install", (event) => {
