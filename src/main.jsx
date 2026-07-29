@@ -571,17 +571,21 @@ async function loadRemoteState(userId) {
   if (!supabaseStatus().configured || !userId) return null;
   try {
     const current = await fetchCurrentState(userId);
-    if (!current?.payload) return null;
     try {
-      const pending = await fetchPendingActions(userId, current.updated_at);
+      // Sem snapshot completo ainda (professor novo, ou a primeira compactação
+      // falhou): as edições existem só como ações soltas. Reconstruir a partir
+      // do zero é obrigatório — antes elas eram simplesmente ignoradas e o
+      // diário aparecia vazio mesmo com tudo gravado no servidor.
+      const pending = await fetchPendingActions(userId, current?.payload ? current.updated_at : undefined);
       if (pending.length) {
-        const reconstructedData = applyPatches(migrateData(current.payload.data), pending);
-        return { ...current.payload, data: reconstructedData };
+        const base = migrateData(current?.payload?.data ?? initialData);
+        const reconstructedData = applyPatches(base, pending);
+        return { ...(current?.payload ?? {}), data: reconstructedData };
       }
     } catch (error) {
       console.warn("Não foi possível aplicar ações pendentes, usando o último snapshot:", error);
     }
-    return current.payload;
+    return current?.payload ?? null;
   } catch (error) {
     console.warn("Supabase load failed:", error);
     return null;
