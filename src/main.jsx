@@ -3919,9 +3919,19 @@ function App() {
       return;
     }
     const validation = validateBackupData(selectedSnapshot.data);
-    if (!validation.valid || selectedSnapshot.integrityStatus === "invalid") {
-      setImportMessage("Esta versão falhou na verificação de segurança e não foi aplicada.");
+    if (!validation.valid) {
+      setImportMessage(`Esta versão contém dados inválidos e não foi aplicada: ${validation.message}`);
       return;
+    }
+    if (selectedSnapshot.integrityStatus === "invalid") {
+      const confirmation = window.prompt(
+        "Não foi possível confirmar a integridade desta versão. Revise os totais exibidos e, somente se reconhecer os dados, digite ATUALIZAR para continuar.",
+        ""
+      );
+      if (confirmation !== "ATUALIZAR") {
+        setImportMessage("Atualização cancelada. Os dados atuais foram preservados.");
+        return;
+      }
     }
     if (syncReview.mode === "restore" && restoreWouldRemoveData(data, selectedSnapshot.data)) {
       const confirmation = window.prompt(
@@ -6229,8 +6239,14 @@ function App() {
                         <span>
                           {summary.classes} turma(s), {summary.students} aluno(s), {summary.assessments} avaliação(ões), {summary.gradeEntries} nota(s)
                         </span>
-                        <small className={snapshot.integrityStatus === "verified" ? "integrity-ok" : "integrity-legacy"}>
-                          {snapshot.integrityStatus === "verified" ? "Integridade verificada" : "Backup legado ? confirme a origem"}
+                        <small className={["verified", "verified-legacy"].includes(snapshot.integrityStatus) ? "integrity-ok" : "integrity-legacy"}>
+                          {snapshot.integrityStatus === "verified"
+                            ? "Integridade verificada"
+                            : snapshot.integrityStatus === "verified-legacy"
+                              ? "Integridade verificada após atualização do formato"
+                              : snapshot.integrityStatus === "invalid"
+                                ? "Integridade não confirmada — revise antes de continuar"
+                                : "Backup legado — confirme a origem"}
                         </small>
                       </button>
                     );
