@@ -36,6 +36,20 @@ import {
   fetchPendingActions,
   deleteActions
 } from "./supabase";
+import {
+  ACTIONS_THROUGH_FIELD,
+  actionsCutoff,
+  nextActionsCutoff,
+  resolveCompactionResult,
+  isPlainObject,
+  stableStringify,
+  normalize,
+  normalizeHeader,
+  normalizeKey,
+  diffData,
+  isPatchEmpty,
+  applyPatches
+} from "./sync-engine";
 import "./styles.css";
 
 const STORAGE_KEY = "checkout-turmas:v3";
@@ -269,9 +283,6 @@ function normalizeAssessmentGrades(grades) {
   return grades && typeof grades === "object" && !Array.isArray(grades) ? grades : {};
 }
 
-function isPlainObject(value) {
-  return !!value && typeof value === "object" && !Array.isArray(value);
-}
 
 function isNativePlatform() {
   return !!window.Capacitor?.isNativePlatform?.();
@@ -339,14 +350,6 @@ async function sha256Hex(text) {
   const bytes = new TextEncoder().encode(text ?? "");
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return Array.from(new Uint8Array(digest)).map((byte) => byte.toString(16).padStart(2, "0")).join("");
-}
-
-function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  if (isPlainObject(value)) {
-    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
-  }
-  return JSON.stringify(value);
 }
 
 async function dataIntegrity(data) {
@@ -567,8 +570,11 @@ function syncDeviceLabel() {
   return "Computador";
 }
 
+// Devolve { payload, appliedActionIds }: os ids importam porque quem gravar
+// esse estado de volta precisa apagar as ações já absorvidas, senão elas são
+// reaplicadas depois por cima de valores mais novos.
 async function loadRemoteState(userId) {
-  if (!supabaseStatus().configured || !userId) return null;
+  if (!supabaseStatus().configured || !userId) return { payload: null, appliedActionIds: [] };
   try {
     const current = await fetchCurrentState(userId);
     try {
@@ -576,19 +582,33 @@ async function loadRemoteState(userId) {
       // falhou): as edições existem só como ações soltas. Reconstruir a partir
       // do zero é obrigatório — antes elas eram simplesmente ignoradas e o
       // diário aparecia vazio mesmo com tudo gravado no servidor.
-      const pending = await fetchPendingActions(userId, current?.payload ? current.updated_at : undefined);
+      //
+      // O filtro sai da marca gravada DENTRO do pacote, nunca do updated_at do
+      // banco: ver actionsCutoff() em sync-engine.js. Usar updated_at fazia
+      // sumir toda edição feita enquanto a compactação subia.
+      const cutoff = current?.payload ? actionsCutoff(current.payload) : null;
+      const pending = await fetchPendingActions(userId, cutoff ?? undefined);
       if (pending.length) {
         const base = migrateData(current?.payload?.data ?? initialData);
-        const reconstructedData = applyPatches(base, pending);
-        return { ...(current?.payload ?? {}), data: reconstructedData };
+        const reconstructedData = applyPatches(base, pending, migrateData);
+        return {
+          payload: {
+            ...(current?.payload ?? {}),
+            data: reconstructedData,
+            // Quem gravar a partir daqui precisa saber até onde as ações já
+            // foram absorvidas, senão elas ficam órfãs de novo.
+            [ACTIONS_THROUGH_FIELD]: nextActionsCutoff(pending, cutoff)
+          },
+          appliedActionIds: pending.map((row) => row.id)
+        };
       }
     } catch (error) {
       console.warn("Não foi possível aplicar ações pendentes, usando o último snapshot:", error);
     }
-    return current?.payload ?? null;
+    return { payload: current?.payload ?? null, appliedActionIds: [] };
   } catch (error) {
     console.warn("Supabase load failed:", error);
-    return null;
+    return { payload: null, appliedActionIds: [] };
   }
 }
 
@@ -1175,72 +1195,6 @@ function mergeBackupData(currentData, importedData) {
 // comparado por uma chave de identidade e só o que mudou (added/updated/removed)
 // vira o "patch" daquela ação — pequeno o bastante pra caber com folga na
 // garantia do navegador de completar o envio mesmo se a aba fechar na hora.
-const DIFF_FIELD_KEYS = {
-  classes: (item) => item.id,
-  events: (item) => item.id ?? stableStringify(item),
-  lessons: (item) => item.id,
-  assessments: (item) => item.id,
-  recoveries: (item) => item.id,
-  attendanceSummaries: (item) =>
-    `${item.classId}|${item.studentId}|${item.periodId}|${normalizeKey(item.source ?? "")}`
-};
-
-function diffData(previous, next) {
-  const patch = {};
-  if (stableStringify(previous?.schoolYear) !== stableStringify(next?.schoolYear)) {
-    patch.schoolYear = next.schoolYear;
-  }
-  for (const [field, keyOf] of Object.entries(DIFF_FIELD_KEYS)) {
-    const prevItems = Array.isArray(previous?.[field]) ? previous[field] : [];
-    const nextItems = Array.isArray(next?.[field]) ? next[field] : [];
-    const prevMap = new Map(prevItems.map((item) => [keyOf(item), item]));
-    const nextMap = new Map(nextItems.map((item) => [keyOf(item), item]));
-    const added = [];
-    const updated = [];
-    const removed = [];
-    for (const [key, item] of nextMap) {
-      const prevItem = prevMap.get(key);
-      if (!prevItem) added.push(item);
-      else if (stableStringify(prevItem) !== stableStringify(item)) updated.push(item);
-    }
-    for (const key of prevMap.keys()) {
-      if (!nextMap.has(key)) removed.push(key);
-    }
-    if (added.length || updated.length || removed.length) {
-      patch[field] = { added, updated, removed };
-    }
-  }
-  return patch;
-}
-
-function isPatchEmpty(patch) {
-  return !patch || Object.keys(patch).length === 0;
-}
-
-function applyFieldPatch(items, keyOf, fieldPatch) {
-  if (!fieldPatch) return items;
-  const map = new Map(items.map((item) => [keyOf(item), item]));
-  for (const key of fieldPatch.removed ?? []) map.delete(key);
-  for (const item of [...(fieldPatch.added ?? []), ...(fieldPatch.updated ?? [])]) map.set(keyOf(item), item);
-  return [...map.values()];
-}
-
-function applyPatch(base, patch) {
-  if (isPatchEmpty(patch)) return base;
-  const result = { ...base };
-  if (patch.schoolYear !== undefined) result.schoolYear = patch.schoolYear;
-  for (const [field, keyOf] of Object.entries(DIFF_FIELD_KEYS)) {
-    if (patch[field]) {
-      result[field] = applyFieldPatch(Array.isArray(base[field]) ? base[field] : [], keyOf, patch[field]);
-    }
-  }
-  return migrateData(result);
-}
-
-function applyPatches(base, patches) {
-  return patches.reduce((acc, { patch }) => applyPatch(acc, patch), base);
-}
-
 function formatDate(value) {
   return new Intl.DateTimeFormat("pt-BR", {
     dateStyle: "short",
@@ -1257,10 +1211,6 @@ function syncSnapshotLabel(value) {
 
 function today() {
   return new Date().toISOString().slice(0, 10);
-}
-
-function normalize(text) {
-  return String(text ?? "").trim().replace(/\s+/g, " ");
 }
 
 function fileSafeName(text) {
@@ -1305,17 +1255,6 @@ function parseStudentList(text) {
   const delimiter = detectDelimiter(lines[0]);
   const rows = lines.map((line) => splitRow(line, delimiter));
   return rowsToStudents(rows);
-}
-
-function normalizeHeader(text) {
-  return normalize(text)
-    .toLowerCase()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "");
-}
-
-function normalizeKey(text) {
-  return normalizeHeader(text).replace(/[^a-z0-9]/g, "");
 }
 
 function nameTokens(text) {
@@ -2424,7 +2363,7 @@ function App() {
     setSupabaseInfo(supabaseStatus());
     try {
       setAutoSaveMessage("Carregando dados da nuvem...");
-      const payload = await loadRemoteState(userId);
+      const { payload, appliedActionIds } = await loadRemoteState(userId);
       if (!payload?.data) {
         if (!silent) setImportMessage("Nenhuma versão remota encontrada.");
         setAutoSaveMessage("Nenhuma versão remota encontrada.");
@@ -2521,7 +2460,11 @@ function App() {
           data: result.data,
           teacherName: mergedTeacherName,
           subjectName: mergedSubjectName,
-          gradeDecimals: mergedGradeDecimals
+          gradeDecimals: mergedGradeDecimals,
+          // As ações que acabaram de ser aplicadas já estão dentro de
+          // result.data. Sem carregar essa marca adiante, a próxima leitura as
+          // aplicaria de novo por cima — revertendo valores mais novos.
+          actionsThrough: payload[ACTIONS_THROUGH_FIELD] ?? null
         });
         try {
           localStorage.setItem(STORAGE_KEY, JSON.stringify(mergedPayload));
@@ -2529,6 +2472,15 @@ function App() {
           // Ignorar falha de backup local
         }
         await saveRemoteState(userId, mergedPayload, { forceSnapshot: true });
+        // Só depois de gravar: as ações absorvidas saem da fila. Se isto
+        // falhar, a marca acima ainda impede que sejam reaplicadas.
+        if (appliedActionIds.length) {
+          try {
+            await deleteActions(userId, appliedActionIds);
+          } catch (error) {
+            console.warn("Não foi possível limpar as ações já absorvidas:", error);
+          }
+        }
         saveLastSyncedHash(mergedPayload.integrity?.hash);
         lastSavedDataRef.current = result.data;
 
@@ -2653,6 +2605,13 @@ function App() {
     }
   }
 
+  // Botão "Salvar": salva. Sem pergunta nenhuma no meio.
+  //
+  // Antes daqui saía um confirm() perguntando se o professor queria enviar um
+  // "backup existente de pasta", e era o *Cancelar* que fazia o salvamento
+  // normal. Ninguém acerta isso na primeira leitura — e errar significava
+  // substituir o diário por um arquivo antigo. O envio de pasta virou uma ação
+  // separada e explícita em Configurações (uploadBackupFromDirectory).
   async function saveToSupabase() {
     if (!supabaseStatus().configured) {
       setImportMessage("Sincronização remota não está configurada.");
@@ -2663,62 +2622,90 @@ function App() {
       return;
     }
 
+    setRemoteSyncLoading(true);
+    try {
+      // Compactação sob demanda: junta as ações pendentes (inclusive de outro
+      // aparelho) com o estado local e grava um snapshot completo, sem esperar
+      // o limite de ações/tempo.
+      const outcome = await compactToSnapshot();
+      setAutoSaveFailed(false);
+      if (outcome?.hadConcurrentEdits) {
+        // Digitaram durante o envio. O auto-save já vai mandar a diferença como
+        // ação nova — mas seria mentira dizer "tudo salvo" agora.
+        setAutoSaveMessage("Dados salvos na nuvem. Enviando as últimas alterações...");
+        setImportMessage("Dados salvos na nuvem. O que foi digitado durante o envio está sendo enviado agora.");
+      } else {
+        setAutoSaveMessage("Dados salvos na nuvem com sucesso.");
+        setHasUnsavedChanges(false);
+        setImportMessage("Dados salvos com sucesso na nuvem.");
+      }
+    } catch (error) {
+      setImportMessage(`Não foi possível salvar na nuvem: ${error?.message ?? "erro desconhecido"}`);
+      setAutoSaveFailed(true);
+      setHasUnsavedChanges(true);
+    } finally {
+      setRemoteSyncLoading(false);
+    }
+  }
+
+  // Substituição deliberada do diário pelo backup mais recente de uma pasta.
+  // Não passa pela mesclagem de ações pendentes: o professor está dizendo
+  // explicitamente "use este arquivo como verdade". Por isso o aviso é direto.
+  async function uploadBackupFromDirectory() {
+    if (!supabaseStatus().configured || !userId) {
+      setImportMessage("Nenhum professor autenticado.");
+      return;
+    }
+    if (typeof window.showDirectoryPicker !== "function") {
+      setImportMessage("Este navegador não permite escolher uma pasta. Use Importar > Backup (.json).");
+      return;
+    }
+    const confirmed = window.confirm(
+      "Isto SUBSTITUI o diário deste aparelho e o da nuvem pelo backup mais recente da pasta escolhida.\n\n" +
+        "Tudo que foi feito depois desse arquivo será perdido. Continuar?"
+    );
+    if (!confirmed) return;
+
     // O showDirectoryPicker exige gesto do usuário: precisa ser chamado antes
     // de qualquer await, senão o navegador recusa com "Must be handling a
-    // user gesture" mesmo em uso real.
+    // user gesture" mesmo em uso real. O confirm() acima é síncrono, então o
+    // gesto ainda vale aqui.
     let directoryHandle = null;
-    if (typeof window.showDirectoryPicker === "function") {
-      const chooseDirectory = window.confirm(
-        "O caminho mais seguro é salvar primeiro localmente. Deseja ainda assim usar um backup existente de pasta para enviar à nuvem? Clique em Cancelar para enviar o estado atual do aplicativo."
-      );
-      if (chooseDirectory) {
-        try {
-          directoryHandle = await window.showDirectoryPicker();
-        } catch (error) {
-          if (error?.name !== "AbortError") throw error;
-          setImportMessage("Envio cancelado. Nenhuma pasta foi selecionada.");
-          return;
-        }
-      }
+    try {
+      directoryHandle = await window.showDirectoryPicker();
+    } catch (error) {
+      if (error?.name !== "AbortError") throw error;
+      setImportMessage("Envio cancelado. Nenhuma pasta foi selecionada.");
+      return;
     }
 
     setRemoteSyncLoading(true);
     try {
-      if (directoryHandle) {
-        // Usar um backup de pasta escolhido à mão é uma substituição deliberada
-        // do estado atual — não passa pela mesclagem de ações pendentes, porque
-        // o professor está dizendo explicitamente "use este arquivo como verdade".
-        const directoryPayload = await readLatestBackupFileFromDirectoryHandle(directoryHandle);
-        if (!directoryPayload) {
-          setImportMessage("Envio cancelado. Nenhum backup válido foi encontrado na pasta.");
-          return;
-        }
-        const migratedData = migrateData(directoryPayload.data);
-        suppressNextAutoSaveRef.current = true;
-        setData(migratedData);
-        try {
-          localStorage.setItem(STORAGE_KEY, JSON.stringify(directoryPayload));
-        } catch {
-          // Ignorar falha de backup local
-        }
-        await saveRemoteState(userId, directoryPayload, { forceSnapshot: true });
-        saveLastSyncedHash(directoryPayload.integrity?.hash);
-        lastSavedDataRef.current = migratedData;
-        pendingActionCountRef.current = 0;
-        lastCompactionAtRef.current = Date.now();
-        await refreshRemoteSnapshots();
-      } else {
-        // Clique manual em "Salvar" = compactação sob demanda: junta as ações
-        // pendentes (inclusive de outro aparelho) com o estado local e grava
-        // um snapshot completo, sem esperar o limite de ações/tempo.
-        await compactToSnapshot();
+      const directoryPayload = await readLatestBackupFileFromDirectoryHandle(directoryHandle);
+      if (!directoryPayload) {
+        setImportMessage("Envio cancelado. Nenhum backup válido foi encontrado na pasta.");
+        return;
       }
-      setAutoSaveMessage("Dados salvos na nuvem com sucesso.");
+      const migratedData = migrateData(directoryPayload.data);
+      suppressNextAutoSaveRef.current = true;
+      setData(migratedData);
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(directoryPayload));
+      } catch {
+        // Ignorar falha de backup local
+      }
+      await saveRemoteState(userId, directoryPayload, { forceSnapshot: true });
+      saveLastSyncedHash(directoryPayload.integrity?.hash);
+      lastSavedDataRef.current = migratedData;
+      pendingActionCountRef.current = 0;
+      lastCompactionAtRef.current = Date.now();
+      await refreshRemoteSnapshots();
+      setAutoSaveMessage("Diário substituído pelo backup da pasta.");
       setAutoSaveFailed(false);
       setHasUnsavedChanges(false);
-      setImportMessage("Dados salvos com sucesso na nuvem.");
+      setImportMessage("Diário substituído pelo backup da pasta e enviado à nuvem.");
     } catch (error) {
-      setImportMessage(`Não foi possível salvar na nuvem: ${error?.message ?? "erro desconhecido"}`);
+      setImportMessage(`Não foi possível enviar o backup da pasta: ${error?.message ?? "erro desconhecido"}`);
       setAutoSaveFailed(true);
       setHasUnsavedChanges(true);
     } finally {
@@ -2731,30 +2718,58 @@ function App() {
     if (compactionInFlightRef.current) return;
     compactionInFlightRef.current = true;
     try {
+      // Estado da tela no início. Guardado pra saber, no fim, se o professor
+      // digitou alguma coisa enquanto o pacote subia.
+      const baseline = dataRef.current;
       const current = await fetchCurrentState(userId);
       const baseData = migrateData(current?.payload?.data ?? initialData);
       // Busca TODAS as ações pendentes (sem filtro de data) — assim, mesmo que
       // alguma tenha ficado "órfã" de uma compactação anterior, ela é varrida
       // aqui também, em vez de ficar presa pra sempre no banco.
       const pending = await fetchPendingActions(userId);
-      const reconstructedRemote = applyPatches(baseData, pending);
-      const merged = mergeBackupData(data, reconstructedRemote).data;
-      suppressNextAutoSaveRef.current = true;
-      setData(merged);
-      const payload = await buildBackupPayload(true, { data: merged });
+      const reconstructedRemote = applyPatches(baseData, pending, migrateData);
+      // Mescla contra o estado mais recente da tela (não contra o da closure):
+      // entre o início e aqui houve duas idas ao servidor.
+      const merged = mergeBackupData(dataRef.current, reconstructedRemote).data;
+      const payload = await buildBackupPayload(true, {
+        data: merged,
+        // A marca para na última ação REALMENTE absorvida. Nunca em "agora":
+        // é o que mantém visível o que for digitado durante este upload.
+        actionsThrough: nextActionsCutoff(
+          pending,
+          current?.payload ? actionsCutoff(current.payload) : null
+        )
+      });
       await saveRemoteState(userId, payload, { forceSnapshot: true });
       if (pending.length) await deleteActions(userId, pending.map((row) => row.id));
       saveLastSyncedHash(payload.integrity?.hash);
+      // O servidor agora tem `merged`; é contra ele que a próxima diferença é
+      // calculada, mesmo que a tela já tenha andado além disso.
       lastSavedDataRef.current = merged;
       pendingActionCountRef.current = 0;
       lastCompactionAtRef.current = Date.now();
-      setHasUnsavedChanges(false);
+
+      // Só agora mexe na tela. Se o professor digitou durante o envio, o que
+      // está na tela vence — antes daqui um setData(merged) apagava tudo que
+      // tinha sido digitado nesses segundos, sem aviso.
+      const outcome = resolveCompactionResult({
+        baseline,
+        latest: dataRef.current,
+        saved: merged,
+        merge: (local, remote) => mergeBackupData(local, remote).data
+      });
+      suppressNextAutoSaveRef.current = outcome.suppressAutoSave;
+      setData(outcome.data);
+      // Com edição concorrente o auto-save precisa rodar pra enviar a
+      // diferença, então o estado continua "pendente" de propósito.
+      setHasUnsavedChanges(outcome.hadConcurrentEdits);
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
       } catch {
         // Ignorar falha de backup local
       }
       await refreshRemoteSnapshots();
+      return outcome;
     } finally {
       compactionInFlightRef.current = false;
     }
@@ -2762,7 +2777,17 @@ function App() {
 
   async function appendActionToSupabase() {
     if (!supabaseStatus().configured || !userId) return;
-    if (autoSaveInFlightRef.current) return;
+    if (autoSaveInFlightRef.current) {
+      // Já há um envio em andamento. Reagendar em vez de descartar: antes esta
+      // alteração ficava esperando o próximo gatilho (troca de aba, volta da
+      // conexão) e, se o professor parasse de digitar aqui, não saía nunca.
+      window.clearTimeout(autoSaveTimerRef.current);
+      autoSaveTimerRef.current = window.setTimeout(() => {
+        autoSaveTimerRef.current = 0;
+        appendActionRef.current();
+      }, AUTO_SYNC_DELAY_MS);
+      return;
+    }
     autoSaveInFlightRef.current = true;
     window.clearTimeout(autoSaveTimerRef.current);
     try {
@@ -2810,6 +2835,11 @@ function App() {
   const autoSaveInFlightRef = useRef(false);
   const compactionInFlightRef = useRef(false);
   const suppressNextAutoSaveRef = useRef(false);
+  // Espelho do estado atual pra quem roda fora do render: a compactação leva
+  // segundos e não pode enxergar o `data` congelado da closure de quando
+  // começou, senão descarta o que foi digitado no meio.
+  const dataRef = useRef(data);
+  dataRef.current = data;
   const lastSavedDataRef = useRef(migrateData(data));
   const pendingActionCountRef = useRef(0);
   const lastCompactionAtRef = useRef(Date.now());
@@ -3871,6 +3901,23 @@ function App() {
     });
   }
 
+  // Gera o arquivo .json com o diário inteiro e deixa o professor guardar onde
+  // quiser. Existia a função de gravar arquivo (saveTextFile), mas nenhum botão
+  // chamava: dava pra IMPORTAR backup e não dava pra exportar. Numa emergência
+  // de sincronização, é a única cópia que não depende de nuvem nem do aparelho.
+  async function exportBackupFile() {
+    try {
+      const payload = await buildBackupPayload(true);
+      const nome = fileSafeName(teacherName) || "diario";
+      const filename = `backup-${nome}-${new Date().toISOString().slice(0, 10)}.json`;
+      const result = await saveTextFile(filename, JSON.stringify(payload, null, 2), "Exportar backup do diário");
+      setImportMessage(result?.message ?? `Backup ${filename} gerado.`);
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      setImportMessage(`Não foi possível gerar o backup: ${error?.message ?? "erro desconhecido"}`);
+    }
+  }
+
   async function buildBackupPayload(includeHistory = false, overrides = {}) {
     const effectiveData = overrides.data ?? data;
     const effectiveTeacherName = overrides.teacherName ?? teacherName;
@@ -3905,6 +3952,10 @@ function App() {
         gradeDecimals: effectiveGradeDecimals
       },
       integrity: currentSnapshot.integrity,
+      // Até onde as ações já entraram neste pacote. Sem isso a leitura não tem
+      // como saber o que ainda falta aplicar e volta a depender do updated_at
+      // do banco — que é justamente o que apagava edições.
+      [ACTIONS_THROUGH_FIELD]: overrides.actionsThrough ?? null,
       data: currentSnapshot.data,
       syncHistory
     };
@@ -6414,6 +6465,25 @@ function App() {
                     Salvar na nuvem
                   </button>
                 </div>
+                <div className="settings-backup-actions">
+                  <button className="secondary" type="button" onClick={() => exportBackupFile()}>
+                    Exportar backup (.json)
+                  </button>
+                  {typeof window !== "undefined" && typeof window.showDirectoryPicker === "function" && (
+                    <button
+                      className="secondary"
+                      type="button"
+                      disabled={remoteSyncLoading || !supabaseInfo.configured}
+                      onClick={() => uploadBackupFromDirectory()}
+                    >
+                      Substituir pelo backup de uma pasta
+                    </button>
+                  )}
+                </div>
+                <small>
+                  Exportar gera um arquivo com o diário inteiro para você guardar. Substituir troca o diário
+                  deste aparelho e o da nuvem por um backup já existente — use só para recuperar uma versão antiga.
+                </small>
                 <div className="settings-backup-actions">
                   <button
                     className="secondary"

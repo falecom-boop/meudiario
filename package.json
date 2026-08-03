@@ -9,8 +9,10 @@
     "desktop": "npm run build && electron .",
     "desktop:dist": "npm run build && electron-builder --win nsis",
     "test:sync": "node scripts/sync-safety.test.mjs",
+    "test:engine": "node scripts/sync-engine.test.mjs",
+    "test:e2e": "node scripts/sync-e2e.test.mjs",
     "test:sw": "node scripts/sw-safety.test.mjs",
-    "test": "npm run test:sync && npm run test:sw",
+    "test": "npm run test:sync && npm run test:engine && npm run test:e2e && npm run test:sw",
     "preview": "vite preview --host 0.0.0.0"
   },
   "build": {
