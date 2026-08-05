@@ -101,12 +101,45 @@ arquivos inválidos.
 O aviso do Vite sobre um pacote maior que 500 kB continua sendo apenas uma
 recomendação de otimização.
 
+## Teste contra o Supabase de verdade
+
+Depois da correção, subi um Supabase **real** na sua máquina (o banco Postgres,
+o PostgREST e o login de verdade, criados a partir do mesmo `schema.sql` do
+projeto) e rodei o teste de dois aparelhos contra ele. Isso fecha a lacuna que
+aparecia em todos os relatórios anteriores: até hoje o servidor era simulado.
+
+**Nada disso encostou no seu diário real.** O banco era local e descartável, e
+os usuários de teste foram apagados no fim. Sua conta de professor não foi
+usada em momento nenhum.
+
+O que ficou provado:
+
+- A correção feita no tablet chega no computador e **o servidor termina com a
+  versão corrigida**. Era exatamente aqui que ela era destruída antes.
+- Rodando o mesmo teste contra a lógica antiga, ele **reprova**: conteúdo,
+  número de aulas e chamada ficam todos no valor velho.
+- A ordem das aulas fica idêntica nos dois aparelhos depois de ir e voltar do
+  banco.
+- A data de edição sobrevive à ida e volta pelo banco — é ela que decide quem
+  vence, então precisava ser confirmada.
+- Um professor não consegue ler o diário de outro, e a chave pública do
+  aplicativo continua sem acesso nenhum às tabelas.
+
+Achado técnico de brinde: o banco guarda as datas com precisão maior do que o
+JavaScript sabe representar. O aplicativo hoje trata isso corretamente, mas era
+por sorte — não havia nada garantindo. Agora há um teste que trava esse
+comportamento, porque a versão errada faria o aplicativo reprocessar a mesma
+alteração para sempre.
+
 ## O que não foi testado
 
-Os caminhos que conversam com o Supabase de verdade não foram exercitados:
-isso exigiria entrar na sua conta. O que está coberto pelos testes é a lógica
-que decide qual versão vence — exatamente onde estava a falha. O transporte em
-si (envio e busca) não foi alterado nesta sessão.
+O teste de integração exercita o miolo da correção (a regra de quem vence) pelo
+transporte real, mas não a função de mesclagem inteira do aplicativo, que vive
+dentro do arquivo principal e não pode ser carregada fora do navegador. Essa
+parte segue coberta pelos testes de unidade e pela verificação no navegador.
+
+Também não foi exercitado o **seu** banco de produção — de propósito, pelo
+motivo explicado acima.
 
 ## Recomendação de uso
 

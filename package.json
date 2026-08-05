@@ -12,7 +12,8 @@
     "test:engine": "node scripts/sync-engine.test.mjs",
     "test:e2e": "node scripts/sync-e2e.test.mjs",
     "test:sw": "node scripts/sw-safety.test.mjs",
-    "test": "npm run test:sync && npm run test:engine && npm run test:e2e && npm run test:sw",
+    "test:supabase": "node scripts/sync-supabase.test.mjs",
+    "test": "npm run test:sync && npm run test:engine && npm run test:e2e && npm run test:sw && npm run test:supabase",
     "preview": "vite preview --host 0.0.0.0"
   },
   "build": {
