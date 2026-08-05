@@ -48,7 +48,10 @@ import {
   normalizeKey,
   diffData,
   isPatchEmpty,
-  applyPatches
+  applyPatches,
+  incomingIsNewer,
+  mergeLessonPair,
+  compareLessonsNewestFirst
 } from "./sync-engine";
 import "./styles.css";
 
@@ -73,6 +76,8 @@ const APP_TITLE = "Meu Diário";
 const APP_VERSION = "2";
 const APP_LOGO_SRC = "icon.png";
 const ATTENDANCE_NOT_TAKEN = "not-taken";
+// Quantas aulas a lista "Registros" mostra antes de pedir "Ver todas as aulas".
+const LESSON_PREVIEW_LIMIT = 8;
 const DEFAULT_GRADE_DECIMALS = 1;
 let activeGradeDecimals = DEFAULT_GRADE_DECIMALS;
 const PERIODS = [
@@ -437,6 +442,9 @@ function migrateData(data) {
             attendance: Array.isArray(lesson.attendance) ? lesson.attendance : [],
             periodId: lessonPeriod(lesson, schoolYear)
           }))
+          // Ordenar aqui, e não em cada tela, é o que garante a MESMA lista em
+          // todos os aparelhos: tudo que entra no app passa por migrateData.
+          .sort(compareLessonsNewestFirst)
       : [],
     attendanceSummaries: normalizeAttendanceSummaries(data?.attendanceSummaries, classes, schoolYear),
     assessments,
@@ -951,15 +959,28 @@ function mergeGradeValue(currentValue, incomingValue) {
   return currentValue;
 }
 
-function mergeGradeValueDetailed(currentValue, incomingValue) {
+// `incomingWins` sai da data de alteração da avaliação (ver incomingIsNewer).
+// Sem ele, duas notas preenchidas e diferentes terminavam SEMPRE com o valor
+// deste aparelho — corrigir uma nota no tablet não mudava nada no PC, e a
+// compactação ainda regravava o valor velho por cima no servidor.
+function mergeGradeValueDetailed(currentValue, incomingValue, incomingWins = false) {
   const currentFilled = normalize(currentValue) || isMissingGrade(currentValue);
   const incomingFilled = normalize(incomingValue) || isMissingGrade(incomingValue);
   if (!incomingFilled) return { value: currentValue, changed: false, conflict: false };
-  if (!currentFilled || isMissingGrade(currentValue)) {
-    return { value: incomingValue, changed: normalize(currentValue) !== normalize(incomingValue), conflict: false };
+  if (!currentFilled) return { value: incomingValue, changed: true, conflict: false };
+  if (normalize(currentValue) === normalize(incomingValue)) {
+    return { value: currentValue, changed: false, conflict: false };
   }
-  const conflict = normalize(currentValue) !== normalize(incomingValue) && !isMissingGrade(incomingValue);
-  return { value: currentValue, changed: false, conflict };
+  // "Não fez" é o estado de quem ainda não teve nota lançada: perde de uma nota
+  // de verdade, venha ela de onde vier.
+  if (isMissingGrade(currentValue) && !isMissingGrade(incomingValue)) {
+    return { value: incomingValue, changed: true, conflict: false };
+  }
+  if (isMissingGrade(incomingValue) && !isMissingGrade(currentValue)) {
+    return { value: currentValue, changed: false, conflict: false };
+  }
+  if (incomingWins) return { value: incomingValue, changed: true, conflict: false };
+  return { value: currentValue, changed: false, conflict: true };
 }
 
 function mergeBackupData(currentData, importedData) {
@@ -974,6 +995,7 @@ function mergeBackupData(currentData, importedData) {
   let classesAdded = 0;
   let studentsAdded = 0;
   let lessonsAdded = 0;
+  let lessonsUpdated = 0;
   let assessmentsAdded = 0;
   let recoveriesAdded = 0;
   let attendanceRecordsMerged = 0;
@@ -1045,13 +1067,13 @@ function mergeBackupData(currentData, importedData) {
       });
       lessonsAdded += 1;
     } else {
-      const existingStudents = new Set(targetLesson.attendance.map((record) => record.studentId));
-      for (const record of remappedAttendance) {
-        if (!existingStudents.has(record.studentId)) {
-          targetLesson.attendance.push(record);
-          attendanceRecordsMerged += 1;
-        }
-      }
+      // A aula existe dos dois lados. Antes daqui só entrava aluno que faltava
+      // na chamada: conteúdo corrigido e presença trocada em outro aparelho
+      // eram descartados em silêncio. Agora vale a versão alterada por último.
+      const resolved = mergeLessonPair(targetLesson, { ...importedLesson, attendance: remappedAttendance });
+      Object.assign(targetLesson, resolved.lesson);
+      attendanceRecordsMerged += resolved.attendanceAdded + resolved.attendanceUpdated;
+      lessonsUpdated += resolved.fieldsUpdated ? 1 : 0;
     }
   }
 
@@ -1087,17 +1109,23 @@ function mergeBackupData(currentData, importedData) {
       });
       assessmentsAdded += 1;
     } else {
+      // updateGrade carimba updatedAt na avaliação, então dá pra saber qual dos
+      // dois aparelhos lançou nota por último e deixar esse vencer o empate.
+      const gradesIncomingWins = incomingIsNewer(targetAssessment, importedAssessment);
       for (const [studentId, grade] of Object.entries(remappedGrades)) {
-        const merged = mergeGradeValueDetailed(targetAssessment.grades[studentId], grade);
+        const merged = mergeGradeValueDetailed(targetAssessment.grades[studentId], grade, gradesIncomingWins);
         targetAssessment.grades[studentId] = merged.value;
         if (merged.changed) gradeValuesMerged += 1;
         if (merged.conflict) gradeConflicts += 1;
       }
       for (const [studentId, grade] of Object.entries(remappedMakeupGrades)) {
-        const merged = mergeGradeValueDetailed(targetAssessment.makeupGrades[studentId], grade);
+        const merged = mergeGradeValueDetailed(targetAssessment.makeupGrades[studentId], grade, gradesIncomingWins);
         targetAssessment.makeupGrades[studentId] = merged.value;
         if (merged.changed) gradeValuesMerged += 1;
         if (merged.conflict) gradeConflicts += 1;
+      }
+      if (gradesIncomingWins && importedAssessment.updatedAt) {
+        targetAssessment.updatedAt = importedAssessment.updatedAt;
       }
       targetAssessment.description = targetAssessment.description || importedAssessment.description || "";
       targetAssessment.maxScore = targetAssessment.maxScore ?? importedAssessment.maxScore ?? 10;
@@ -1143,11 +1171,15 @@ function mergeBackupData(currentData, importedData) {
       });
       recoveriesAdded += 1;
     } else {
+      const recoveryIncomingWins = incomingIsNewer(targetRecovery, importedRecovery);
       for (const [studentId, grade] of Object.entries(remappedGrades)) {
-        const merged = mergeGradeValueDetailed(targetRecovery.grades[studentId], grade);
+        const merged = mergeGradeValueDetailed(targetRecovery.grades[studentId], grade, recoveryIncomingWins);
         targetRecovery.grades[studentId] = merged.value;
         if (merged.changed) gradeValuesMerged += 1;
         if (merged.conflict) gradeConflicts += 1;
+      }
+      if (recoveryIncomingWins && importedRecovery.updatedAt) {
+        targetRecovery.updatedAt = importedRecovery.updatedAt;
       }
     }
   }
@@ -1186,7 +1218,7 @@ function mergeBackupData(currentData, importedData) {
       assessments,
       recoveries
     }),
-    summary: { classesAdded, studentsAdded, lessonsAdded, assessmentsAdded, recoveriesAdded, attendanceRecordsMerged, gradeValuesMerged, gradeConflicts }
+    summary: { classesAdded, studentsAdded, lessonsAdded, lessonsUpdated, assessmentsAdded, recoveriesAdded, attendanceRecordsMerged, gradeValuesMerged, gradeConflicts }
   };
 }
 
@@ -2324,6 +2356,7 @@ function App() {
   const [reportAttendanceScope, setReportAttendanceScope] = useState("period");
   const [reportMonth, setReportMonth] = useState(today().slice(0, 7));
   const [studentInfoId, setStudentInfoId] = useState("");
+  const [showAllLessons, setShowAllLessons] = useState(false);
   const [supabaseInfo, setSupabaseInfo] = useState(supabaseStatus());
   const [remoteSyncLoading, setRemoteSyncLoading] = useState(false);
   const [remoteSnapshots, setRemoteSnapshots] = useState([]);
@@ -2488,12 +2521,13 @@ function App() {
           result.summary.classesAdded +
           result.summary.studentsAdded +
           result.summary.lessonsAdded +
+          (result.summary.lessonsUpdated ?? 0) +
           result.summary.assessmentsAdded +
           (result.summary.recoveriesAdded ?? 0) +
           (result.summary.attendanceRecordsMerged ?? 0) +
           (result.summary.gradeValuesMerged ?? 0);
         const mergeMessage = addedTotal
-          ? `Sincronizamos alterações de outro aparelho: ${result.summary.classesAdded} turma(s), ${result.summary.studentsAdded} aluno(s), ${result.summary.lessonsAdded} aula(s), ${result.summary.assessmentsAdded} avaliação(ões) adicionadas automaticamente.${result.summary.gradeConflicts ? ` ${result.summary.gradeConflicts} conflito(s) de nota foram mantidos com o valor deste aparelho.` : ""}`
+          ? `Sincronizamos alterações de outro aparelho: ${result.summary.classesAdded} turma(s), ${result.summary.studentsAdded} aluno(s), ${result.summary.lessonsAdded} aula(s), ${result.summary.assessmentsAdded} avaliação(ões) adicionadas automaticamente.${result.summary.lessonsUpdated ? ` ${result.summary.lessonsUpdated} aula(s) atualizadas com a versão mais recente.` : ""}${result.summary.gradeConflicts ? ` ${result.summary.gradeConflicts} conflito(s) de nota foram mantidos com o valor deste aparelho.` : ""}`
           : "Dados já sincronizados.";
         setAutoSaveMessage(mergeMessage);
         if (!silent) setImportMessage(mergeMessage);
@@ -4903,7 +4937,13 @@ function App() {
     );
 
     const diarioRows = [["Data", "Turma", "Aulas", "Conteúdo", "Aluno", "Frequência"]];
-    for (const lesson of data.lessons.filter((item) => isAnnualExport || item.periodId === exportPeriod)) {
+    // Na planilha a leitura é cronológica, do começo do período para o fim —
+    // o contrário da tela, que mostra a aula mais recente primeiro.
+    const diarioLessons = data.lessons
+      .filter((item) => isAnnualExport || item.periodId === exportPeriod)
+      .slice()
+      .reverse();
+    for (const lesson of diarioLessons) {
       for (const record of lesson.attendance) {
         diarioRows.push([
           dateFormatter.format(new Date(`${lesson.date}T12:00:00`)),
@@ -7445,11 +7485,21 @@ function App() {
 
         <section className="history">
           <div className="section-title">
-            <h2>Registros</h2>
+            <div>
+              <h2>Registros</h2>
+              {classLessons.length > 0 && (
+                <p>
+                  {classLessons.length} aula(s) em {periodLabel(selectedPeriod)}
+                  {classLessons.length > LESSON_PREVIEW_LIMIT && !showAllLessons
+                    ? ` — mostrando as ${LESSON_PREVIEW_LIMIT} mais recentes`
+                    : ""}
+                </p>
+              )}
+            </div>
             <Clock3 size={18} />
           </div>
-          <div className="history-list">
-            {classLessons.slice(0, 8).map((lesson) => (
+          <div className={showAllLessons ? "history-list expanded" : "history-list"}>
+            {(showAllLessons ? classLessons : classLessons.slice(0, LESSON_PREVIEW_LIMIT)).map((lesson) => (
               <article className="lesson-item" key={lesson.id}>
                 <div>
                   <strong>{new Intl.DateTimeFormat("pt-BR").format(new Date(`${lesson.date}T12:00:00`))}</strong>
@@ -7475,6 +7525,12 @@ function App() {
 
             {!classLessons.length && <p className="empty">Os registros aparecem aqui.</p>}
           </div>
+
+          {classLessons.length > LESSON_PREVIEW_LIMIT && (
+            <button className="secondary lesson-show-all" type="button" onClick={() => setShowAllLessons((value) => !value)}>
+              {showAllLessons ? "Mostrar só as mais recentes" : `Ver todas as aulas (${classLessons.length})`}
+            </button>
+          )}
         </section>
       </section>
     </main>

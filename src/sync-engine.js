@@ -171,3 +171,125 @@ export function resolveCompactionResult({ baseline, latest, saved, merge }) {
   }
   return { data: merge(latest, saved), suppressAutoSave: false, hadConcurrentEdits: true };
 }
+
+// --- Conflito entre dois aparelhos ------------------------------------------
+//
+// A mesclagem só sabia ADICIONAR o que faltava: item que já existia dos dois
+// lados era mantido como está. Corrigir uma aula no tablet, portanto, não
+// chegava no PC — e era pior que isso, porque a compactação do PC mescla o
+// estado local com o que veio do servidor, grava o resultado e APAGA as ações
+// já lidas. A correção do tablet sumia do servidor também. Daí "o que vejo no
+// tablet é diferente do que vejo no PC".
+//
+// A regra agora é: quem foi alterado por último vence. Empate ou carimbo
+// ausente mantém o que está na tela — na dúvida, não mexer.
+
+// Momento da última alteração de um item. `updatedAt` só existe depois de uma
+// edição; antes disso vale a criação.
+export function recordStamp(item) {
+  return toTime(item?.updatedAt) ?? toTime(item?.createdAt);
+}
+
+export function incomingIsNewer(current, incoming) {
+  const incomingTime = recordStamp(incoming);
+  if (incomingTime === null) return false;
+  const currentTime = recordStamp(current);
+  if (currentTime === null) return true;
+  return incomingTime > currentTime;
+}
+
+const REAL_ATTENDANCE_STATUSES = new Set(["present", "absent", "excused"]);
+
+export function isRealAttendanceStatus(status) {
+  return REAL_ATTENDANCE_STATUSES.has(status);
+}
+
+// Une as duas listas de chamada de uma mesma aula.
+//
+// Nunca perde aluno: quem existe só de um lado entra. Para quem existe nos
+// dois, chamada feita ganha de chamada não feita — só entre dois status reais
+// é que a data decide.
+//
+// A prioridade do status real vem ANTES da data de propósito, e isso tem um
+// preço conhecido: marcar de volta "Não chamada" num aparelho não apaga a
+// chamada no outro. É o lado seguro do erro. O carimbo é da AULA inteira, não
+// de cada aluno — então uma edição de conteúdo feita depois, em um aparelho
+// que nunca recebeu a chamada, apagaria faltas já lançadas se a data mandasse
+// aqui. Perder falta lançada é estrago em documento oficial; sobrar uma
+// chamada que o professor quis limpar é visível na tela e ele refaz.
+export function mergeAttendance(currentList, incomingList, incomingWins) {
+  const attendance = (currentList ?? []).map((record) => ({ ...record }));
+  const byStudent = new Map(attendance.map((record) => [record.studentId, record]));
+  let added = 0;
+  let updated = 0;
+
+  for (const incoming of incomingList ?? []) {
+    const existing = byStudent.get(incoming.studentId);
+    if (!existing) {
+      const copy = { ...incoming };
+      attendance.push(copy);
+      byStudent.set(copy.studentId, copy);
+      added += 1;
+      continue;
+    }
+    if (existing.status === incoming.status) continue;
+    const currentIsReal = isRealAttendanceStatus(existing.status);
+    const incomingIsReal = isRealAttendanceStatus(incoming.status);
+    if (currentIsReal && !incomingIsReal) continue;
+    if (!currentIsReal || incomingWins) {
+      existing.status = incoming.status;
+      if (incoming.studentName) existing.studentName = incoming.studentName;
+      updated += 1;
+    }
+  }
+
+  return { attendance, added, updated };
+}
+
+// `className` fica de fora de propósito: o nome da turma é resolvido pelo
+// mapeamento de turmas de quem chama, não copiado do outro aparelho.
+export const LESSON_SCALAR_FIELDS = ["date", "periodId", "periods", "content"];
+
+export function mergeLessonPair(current, incoming) {
+  const incomingWins = incomingIsNewer(current, incoming);
+  const lesson = { ...current };
+  let fieldsUpdated = 0;
+
+  if (incomingWins) {
+    for (const field of LESSON_SCALAR_FIELDS) {
+      if (incoming[field] === undefined) continue;
+      if (stableStringify(lesson[field]) === stableStringify(incoming[field])) continue;
+      lesson[field] = incoming[field];
+      fieldsUpdated += 1;
+    }
+    if (incoming.updatedAt) lesson.updatedAt = incoming.updatedAt;
+  }
+
+  const merged = mergeAttendance(current.attendance, incoming.attendance, incomingWins);
+  lesson.attendance = merged.attendance;
+
+  return {
+    lesson,
+    fieldsUpdated,
+    attendanceAdded: merged.added,
+    attendanceUpdated: merged.updated
+  };
+}
+
+// Ordem canônica das aulas — a mesma em qualquer aparelho.
+//
+// Sem isto a ordem do array era só o histórico de como cada aparelho montou os
+// dados: aula criada aqui entra no topo (saveLesson), aula que chega pela
+// sincronização entra no fim (applyPatch e mergeBackupData empilham). Dois
+// aparelhos com exatamente os mesmos dados listavam as aulas em ordens
+// diferentes, e a lista "Registros", que mostra só as primeiras, chegava a
+// esconder aula que aparecia no outro aparelho.
+export function compareLessonsNewestFirst(left, right) {
+  const byDate = String(right?.date ?? "").localeCompare(String(left?.date ?? ""));
+  if (byDate) return byDate;
+  const byCreatedAt = String(right?.createdAt ?? "").localeCompare(String(left?.createdAt ?? ""));
+  if (byCreatedAt) return byCreatedAt;
+  // Desempate final por id: sem ele, duas aulas do mesmo dia sem carimbo
+  // ficariam na ordem em que cada aparelho por acaso as tinha.
+  return String(left?.id ?? "").localeCompare(String(right?.id ?? ""));
+}

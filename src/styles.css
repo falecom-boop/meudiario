@@ -1157,6 +1157,19 @@ h3 {
   gap: 8px;
 }
 
+/* Com "Ver todas as aulas" ligado a lista pode passar de cem itens: rola dentro
+   do próprio painel em vez de esticar a página inteira. */
+.history-list.expanded {
+  max-height: 60vh;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.lesson-show-all {
+  margin-top: 10px;
+  width: 100%;
+}
+
 .class-item {
   background: #f8fafc;
   color: #0f172a;
